@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local application data, caches, and trained model artefacts
+data/enrolled/*
+!data/enrolled/.gitkeep
+data/cache/
+models/*
+!models/.gitkeep
+
+# Training logs
+train_log*.txt
+
+# Editor / OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Training_Data.zip
+ 
+ 
