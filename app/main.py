@@ -147,6 +147,31 @@ def _sync_demo_class_names() -> None:
         _classifier.update_class_records(class_records)
 
 
+def _warm_up_classifier() -> None:
+    """Load the model in the background right after startup.
+
+    The HTTP port opens immediately (so ``/api/health`` answers at once), and
+    ``model_loaded`` flips to ``true`` once TensorFlow has been imported and the
+    Keras model is resident in memory. Without this, ``/api/health`` reports
+    ``model_loaded: false`` for every request until something else touches the
+    model, which looks like a broken server.
+    """
+
+    def worker() -> None:
+        try:
+            _get_classifier()
+            print("[warmup] model loaded")
+        except Exception as error:  # pragma: no cover - best-effort warm-up
+            print(f"[warmup] model load failed: {error}")
+
+    threading.Thread(target=worker, name="footprint-warmup", daemon=True).start()
+
+
+@app.on_event("startup")
+async def _startup_warm_up() -> None:
+    _warm_up_classifier()
+
+
 def _save_metadata(child_id: str, child_name: str, image_count: int) -> None:
     """Add or update a child in the metadata file atomically."""
     meta_path = DATA_DIR / "metadata.json"
@@ -228,16 +253,22 @@ def _child_directory(child_id: str) -> Path:
 
 
 def _preprocess_upload(image: np.ndarray) -> dict:
-    """Run the ROI → enhancement pipeline and return displayable previews."""
-    from app.preprocessing.enhancement import enhance_footprint
+    """Run the ROI → enhancement → background-suppression pipeline.
+
+    The final ``enhanced`` image is the crease pattern with a pure-black
+    background, so neither training nor identification can key on background
+    texture or lighting.
+    """
+    from app.preprocessing.enhancement import enhance_footprint, focus_on_creases
     from app.preprocessing.roi_detection import process_footprint
 
     roi_result = process_footprint(image, return_visualization=True)
     roi_image = roi_result["roi"]
     enhancement = enhance_footprint(roi_image)
+    focused = focus_on_creases(enhancement["enhanced"])
     return {
         "roi": roi_image,
-        "enhanced": enhancement["enhanced"],
+        "enhanced": focused,
         "clahe": enhancement.get("clahe"),
         "gabor_fused": enhancement.get("gabor_fused"),
         "roi_viz": roi_result.get("visualization"),
@@ -345,7 +376,7 @@ async def enroll_child(
 @app.post("/api/identify")
 async def identify_footprint(file: UploadFile = File(...)):
     """Identify a child from a footprint image."""
-    from app.preprocessing.enhancement import enhance_footprint
+    from app.preprocessing.enhancement import enhance_footprint, focus_on_creases
     from app.preprocessing.roi_detection import process_footprint
 
     try:
@@ -365,6 +396,7 @@ async def identify_footprint(file: UploadFile = File(...)):
         roi_viz = None
 
     enhanced_image = enhance_footprint(roi_image)["enhanced"]
+    enhanced_image = focus_on_creases(enhanced_image)
 
     classifier = _get_classifier()
     prediction = classifier.predict(enhanced_image)
@@ -699,11 +731,19 @@ async def model_info():
 # API: Enrollment-based retraining
 # ---------------------------------------------------------------------------
 @app.post("/api/retrain")
-async def retrain_model(
-    epochs: int = Query(default=12, ge=1, le=100),
+def retrain_model(
+    epochs: int = Query(default=40, ge=1, le=200),
     architecture: str = Query(default="custom_cnn"),
+    fine_tune_epochs: int = Query(default=12, ge=0, le=50),
 ):
-    """Train a child-identity model from the preprocessed enrolled-image folders."""
+    """Train a child-identity model from the preprocessed enrolled-image folders.
+
+    Declared ``def`` rather than ``async def`` on purpose: training is a long,
+    CPU-bound, synchronous call.  FastAPI runs it in its worker threadpool, so
+    the asyncio event loop keeps accepting connections while training runs.
+    Blocking the loop for many minutes previously killed uvicorn's Windows
+    accept loop with ``OSError [WinError 64]``.
+    """
     global _classifier
     from app.inference.architectures import normalize_architecture_name
     from app.inference.training import retrain_from_enrollments
@@ -711,7 +751,11 @@ async def retrain_model(
     try:
         architecture = normalize_architecture_name(architecture)
         result = retrain_from_enrollments(
-            DATA_DIR, MODELS_DIR, epochs=epochs, architecture=architecture
+            DATA_DIR,
+            MODELS_DIR,
+            epochs=epochs,
+            architecture=architecture,
+            fine_tune_epochs=fine_tune_epochs,
         )
     except ValueError as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
@@ -722,6 +766,12 @@ async def retrain_model(
     # registry from the three-architecture comparison already exists.
     _activate_enrollment_model(result, architecture)
     _classifier = None
+    # Reload immediately so /api/health keeps reporting model_loaded: true and
+    # the first identification after retraining does not pay the load cost.
+    try:
+        _get_classifier()
+    except Exception:  # pragma: no cover - best effort warm-up
+        pass
     return JSONResponse({"success": True, **result})
 
 
@@ -992,4 +1042,13 @@ async def enroll_sample(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=True)
+    # Pass the already-imported app object (not the "app.main:app" string) so
+    # this works no matter which directory the file is launched from.
+    # reload=False keeps everything in a single process that lives until Ctrl+C.
+    uvicorn.run(
+        app,
+        host=os.environ.get("FOOTPRINT_HOST", "127.0.0.1"),
+        port=int(os.environ.get("FOOTPRINT_PORT", "8000")),
+        reload=False,
+        log_level="info",
+    )

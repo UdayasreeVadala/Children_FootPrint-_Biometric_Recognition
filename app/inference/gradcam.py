@@ -89,10 +89,10 @@ def make_gradcam_heatmap(
 
     # Build a sub-model that outputs both the conv-layer activations
     # and the final predictions.
-    last_conv_layer = _resolve_conv_layer(model, last_conv_layer_name)
+    conv_tensor, prediction_tensor = _grad_tensors(model, last_conv_layer_name)
     grad_model = tf.keras.Model(
         inputs=model.inputs,
-        outputs=[last_conv_layer.output, model.output],
+        outputs=[conv_tensor, prediction_tensor],
     )
 
     with tf.GradientTape() as tape:
@@ -138,17 +138,21 @@ def make_similarity_gradcam_heatmap(
     if tf is None:
         raise RuntimeError("TensorFlow is required for Grad-CAM. Run pip install -r requirements.txt.")
 
-    last_conv_layer = _resolve_conv_layer(model, last_conv_layer_name)
     try:
-        embedding_layer = model.get_layer(embedding_layer_name)
+        model.get_layer(embedding_layer_name)
     except ValueError as error:
         raise ValueError(
             f"The model does not expose an '{embedding_layer_name}' layer for similarity Grad-CAM."
         ) from error
 
+    conv_tensor, embedding_tensor = _grad_tensors(
+        model,
+        last_conv_layer_name,
+        extra_layer_name=embedding_layer_name,
+    )
     grad_model = tf.keras.Model(
         inputs=model.inputs,
-        outputs=[last_conv_layer.output, embedding_layer.output],
+        outputs=[conv_tensor, embedding_tensor],
     )
     target = np.asarray(target_embedding, dtype=np.float32).reshape(-1)
     target_tensor = tf.convert_to_tensor(target, dtype=tf.float32)
@@ -395,11 +399,96 @@ def gradcam_to_base64(image: np.ndarray) -> str:
 # Internal helpers
 # ------------------------------------------------------------------
 
+def _contains_layer(model: tf.keras.Model, layer_name: str, *, _depth: int = 0) -> bool:
+    """Return True when *layer_name* exists anywhere inside *model*."""
+    if _depth > 8:  # guard against pathological nesting
+        return False
+    try:
+        model.get_layer(layer_name)
+        return True
+    except ValueError:
+        pass
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.Model) and _contains_layer(layer, layer_name, _depth=_depth + 1):
+            return True
+    return False
+
+
+def _forward_capture(
+    model: tf.keras.Model,
+    layer_names: set[str],
+) -> tuple[dict[str, tf.Tensor], tf.Tensor]:
+    """Replay ``model``'s top-level layers on ``model.inputs``.
+
+    Returns the tensors produced by each requested top-level layer, plus the
+    final output tensor. Every returned tensor is wired to ``model.inputs``.
+    """
+    if not isinstance(model.inputs, (list, tuple)) or len(model.inputs) != 1:
+        raise ValueError("Grad-CAM expects a single-input model.")
+
+    tensor = model.inputs[0]
+    captured: dict[str, tf.Tensor] = {}
+    remaining = set(layer_names)
+
+    for layer in model.layers:
+        if isinstance(layer, tf.keras.layers.InputLayer):
+            continue
+        tensor = layer(tensor)
+        if layer.name in remaining:
+            captured[layer.name] = tensor
+            remaining.discard(layer.name)
+
+    if remaining:
+        missing = ", ".join(sorted(remaining))
+        raise ValueError(f"Could not locate layer output(s) for: {missing}")
+    return captured, tensor
+
+
+def _grad_tensors(
+    model: tf.keras.Model,
+    layer_name: str,
+    *,
+    extra_layer_name: str | None = None,
+) -> tuple[tf.Tensor, tf.Tensor]:
+    """Return (activation, second_output) tensors connected to ``model.inputs``.
+
+    A Keras functional sub-model keeps its symbolic ``.output`` attached to its
+    *own* input tensor, so after reloading a model, building a grad-model from
+    ``model.inputs`` to ``backbone.output`` fails with::
+
+        Graph disconnected: cannot obtain value for tensor ... at layer "Conv1"
+
+    Re-invoking the layers rebuilds the activations inside the outer graph,
+    which fixes that without changing the model.
+    """
+    activation_name = _resolve_conv_layer(model, layer_name).name
+    targets = {activation_name}
+    if extra_layer_name:
+        targets.add(extra_layer_name)
+
+    captured, final_tensor = _forward_capture(model, targets)
+    activation = captured[activation_name]
+    if extra_layer_name:
+        return activation, captured[extra_layer_name]
+    return activation, final_tensor
+
+
 def _resolve_conv_layer(
     model: tf.keras.Model,
     layer_name: str,
 ) -> tf.keras.layers.Layer:
-    """Resolve a convolutional layer by name, searching nested sub-models.
+    """Resolve a layer by name, always returning one wired into *model*.
+
+    Keras functional sub-models (for example MobileNetV2 wrapped as the
+    ``backbone`` layer) keep their own input tensor. Taking the output of a
+    layer *inside* such a sub-model yields a grad-model whose inputs are not
+    connected to ``model.inputs``, so building it fails with::
+
+        Graph disconnected: cannot obtain value for tensor ... at layer "Conv1"
+
+    When the requested layer lives inside a nested sub-model we therefore
+    return the *sub-model itself*. Its output is a spatial feature map that is
+    reachable from ``model.inputs``, which is all Grad-CAM needs.
 
     Parameters
     ----------
@@ -417,19 +506,16 @@ def _resolve_conv_layer(
     ValueError
         If the layer cannot be found.
     """
-    # Direct lookup first
+    # Direct lookup first: a top-level layer is always safe to use.
     try:
         return model.get_layer(layer_name)
     except ValueError:
         pass
 
-    # Search inside nested models (e.g. MobileNetV2 wrapped in a functional model)
+    # Otherwise fall back to the outermost sub-model that contains the layer.
     for layer in model.layers:
-        if hasattr(layer, "get_layer"):
-            try:
-                return layer.get_layer(layer_name)
-            except ValueError:
-                continue
+        if isinstance(layer, tf.keras.Model) and _contains_layer(layer, layer_name):
+            return layer
 
     raise ValueError(
         f"Layer '{layer_name}' not found in model or any nested sub-model."

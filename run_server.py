@@ -1,22 +1,17 @@
 #!/usr/bin/env python
-import subprocess, sys, os, time
+"""Deprecated alias kept for compatibility.
 
-# Start uvicorn server
-proc = subprocess.Popen(
-    [sys.executable, '-c',
-     'import uvicorn; uvicorn.run("app.main:app", host="127.0.0.1", port=8000, reload=False, log_level="error")'],
-    cwd=r'D:\Children_FootPrint _Biometric_Recognition',
-    stdout=subprocess.PIPE,
-    stderr=subprocess.PIPE
-)
+The server used to be started here as a detached child process, which caused it
+to be killed as soon as this script exited. Use ``launch_server.py`` instead;
+it owns the server in a single long-lived process.
+"""
 
-# Wait for startup and verify
-time.sleep(8)
+import os
+import runpy
+import sys
 
-import urllib.request
-try:
-    r = urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=5)
-    print(f'Server started: {r.status}')
-except Exception as e:
-    print(f'Server failed: {e}')
-    proc.terminate()
+if __name__ == "__main__":
+    here = os.path.dirname(os.path.abspath(__file__))
+    print("run_server.py is deprecated - starting launch_server.py instead.\n")
+    sys.argv = [os.path.join(here, "launch_server.py")]
+    runpy.run_path(sys.argv[0], run_name="__main__")

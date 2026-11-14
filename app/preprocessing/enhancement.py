@@ -188,6 +188,138 @@ def enhance_footprint(
     }
 
 
+def _local_texture_energy(gray: np.ndarray, kernel_size: int = 15) -> np.ndarray:
+    """Local standard deviation of an image (a cheap texture-energy map)."""
+    values = gray.astype(np.float32)
+    mean = cv2.blur(values, (kernel_size, kernel_size))
+    mean_square = cv2.blur(values * values, (kernel_size, kernel_size))
+    variance = np.maximum(mean_square - mean * mean, 0.0)
+    return np.sqrt(variance)
+
+
+def estimate_pattern_mask(
+    image: np.ndarray,
+    *,
+    kernel_size: int = 15,
+    percentile: float = 40.0,
+    dilate: int = 2,
+) -> np.ndarray:
+    """Estimate the crease-pattern support region from local texture energy.
+
+    The background of an enhanced footprint is **not** black.  The Gabor stage
+    is zero-mean and the final ``NORM_MINMAX`` rescale lifts the smooth
+    background to a mid-grey (roughly 40-60 out of 255), so thresholding on
+    intensity keeps ~98% of the frame and removes nothing.  Creases, however,
+    are high-frequency while the background is smooth, so the *local standard
+    deviation* separates them reliably regardless of that offset (a constant
+    offset cancels out of a variance).
+
+    The gate is ``local_std > percentile(nonzero local_std)``, lightly closed
+    to merge ridge fragments and dilated for a small safety margin.
+
+    Returns an ``uint8`` mask (0 or 255) the same size as the input.
+    """
+    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = gray.astype(np.uint8, copy=False)
+    full = np.full(gray.shape, 255, dtype=np.uint8)
+
+    energy = _local_texture_energy(gray, kernel_size)
+    nonzero = energy[energy > 0]
+    if nonzero.size < 64:
+        return full
+
+    threshold = float(np.percentile(nonzero, percentile))
+    if threshold <= 0.0:
+        return full
+
+    gate = (energy > threshold).astype(np.uint8) * 255
+    gate = cv2.morphologyEx(
+        gate,
+        cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        iterations=1,
+    )
+    if dilate > 0:
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (2 * dilate + 1, 2 * dilate + 1)
+        )
+        gate = cv2.dilate(gate, kernel, iterations=1)
+
+    if cv2.countNonZero(gate) < 64:
+        return full
+    return gate
+
+
+def focus_on_creases(
+    image: np.ndarray,
+    mask: np.ndarray | None = None,
+    *,
+    low: float = 2.0,
+    high: float = 98.0,
+    soft: float = 3.0,
+    normalise: bool = True,
+) -> np.ndarray:
+    """Keep only the crease pattern and force the background to pure black.
+
+    The support mask (see :func:`estimate_pattern_mask`) is feather-blurred into
+    a weight map, so the transition is gradual rather than blocky.  Everything
+    outside the pattern is multiplied by zero and can never reach the
+    classifier, which is what removes background/lighting shortcuts.
+
+    Contrast is then re-stretched using percentiles measured **inside** the
+    pattern only, maximising crease contrast without re-brightening the
+    background.
+
+    Args:
+        image: Enhanced grayscale (or BGR) footprint image.
+        mask: Optional support mask. When omitted it is estimated from *image*.
+        low, high: Percentiles used for the contrast stretch.
+        soft: Gaussian sigma used to feather the mask. ``0`` keeps it hard.
+        normalise: Set to ``False`` to only mask, without rescaling.
+
+    Returns:
+        ``uint8`` grayscale image with a black background.
+    """
+    gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    gray = gray.astype(np.uint8, copy=False)
+
+    if mask is None:
+        mask = estimate_pattern_mask(gray)
+    else:
+        mask = (np.asarray(mask) > 0).astype(np.uint8) * 255
+        if mask.shape != gray.shape:
+            mask = cv2.resize(
+                mask, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST
+            )
+
+    if cv2.countNonZero(mask) < 32:
+        return gray.copy()
+
+    if soft and soft > 0:
+        weight = cv2.GaussianBlur(mask, (0, 0), soft).astype(np.float32) / 255.0
+    else:
+        weight = mask.astype(np.float32) / 255.0
+
+    focused = gray.astype(np.float32) * weight
+    if not normalise:
+        return np.clip(focused, 0.0, 255.0).astype(np.uint8)
+
+    inside = weight > 0.5
+    values = focused[inside]
+    if values.size < 32:
+        return np.clip(focused, 0.0, 255.0).astype(np.uint8)
+
+    low_value = float(np.percentile(values, low))
+    high_value = float(np.percentile(values, high))
+    if high_value - low_value < 1e-3:
+        return np.clip(focused, 0.0, 255.0).astype(np.uint8)
+
+    focused = (focused - low_value) * (255.0 / (high_value - low_value))
+    # Re-apply the weight so feathered edges and the background stay black.
+    focused = np.clip(focused, 0.0, 255.0) * weight
+    return focused.astype(np.uint8)
+
+
 def get_enhancement_visualization(
     original: np.ndarray, enhancement_result: dict
 ) -> np.ndarray:

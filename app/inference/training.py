@@ -117,48 +117,267 @@ def build_training_model(num_classes: int, architecture: str = "custom_cnn"):
         return build_classification_model(architecture, num_classes, weights=None, dropout=0.30)
 
 
+def _stratified_enrollment_split(
+    labels: np.ndarray,
+    *,
+    val_fraction: float = 0.2,
+    seed: int = 42,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Hold out a per-class validation slice so overfitting is measurable."""
+    rng = np.random.default_rng(seed)
+    labels = np.asarray(labels)
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+
+    for class_index in np.unique(labels):
+        indices = np.where(labels == class_index)[0]
+        rng.shuffle(indices)
+        if len(indices) >= 3:
+            count = max(1, int(round(len(indices) * val_fraction)))
+            count = min(count, len(indices) - 2)
+        else:
+            count = 0
+        val_indices.extend(indices[:count].tolist())
+        train_indices.extend(indices[count:].tolist())
+
+    return (
+        np.asarray(train_indices, dtype=np.int64),
+        np.asarray(val_indices, dtype=np.int64),
+    )
+
+
+def _enrollment_augmentation_layers() -> "tf.keras.Sequential":
+    """Geometric augmentation that keeps the background at exactly zero."""
+    _require_tensorflow()
+    return tf.keras.Sequential(
+        [
+            tf.keras.layers.RandomRotation(0.05, fill_mode="constant", fill_value=0.0),
+            tf.keras.layers.RandomTranslation(0.10, 0.10, fill_mode="constant", fill_value=0.0),
+            tf.keras.layers.RandomZoom(0.15, 0.15, fill_mode="constant", fill_value=0.0),
+        ],
+        name="enrollment_geometry_augmentation",
+    )
+
+
+def _random_erasing(images, probability: float = 0.4):
+    """Blank a random rectangle to stop the head memorising fixed crease spots."""
+    height = tf.shape(images)[0]
+    width = tf.shape(images)[1]
+    box_fraction = tf.random.uniform([], 0.08, 0.25)
+    box_height = tf.cast(tf.cast(height, tf.float32) * box_fraction, tf.int32)
+    box_width = tf.cast(tf.cast(width, tf.float32) * box_fraction, tf.int32)
+    top = tf.random.uniform([], 0, tf.maximum(1, height - box_height), dtype=tf.int32)
+    left = tf.random.uniform([], 0, tf.maximum(1, width - box_width), dtype=tf.int32)
+
+    rows = tf.range(height)
+    columns = tf.range(width)
+    row_mask = (rows >= top) & (rows < top + box_height)
+    column_mask = (columns >= left) & (columns < left + box_width)
+    rectangle = tf.cast(row_mask[:, None] & column_mask[None, :], tf.float32)
+
+    keep = tf.where(
+        tf.random.uniform([]) < probability,
+        1.0 - rectangle,
+        tf.ones_like(rectangle),
+    )
+    return images * keep[..., None]
+
+
+def _augment_enrollment_batch(images, labels, geometry):
+    """Heavy augmentation for a single image (called from ``tf.data``).
+
+    Gain, gamma and noise are all applied in a way that leaves the suppressed
+    background at exactly ``0``, so the network still never sees background.
+    """
+    tensor = tf.cast(images, tf.float32)
+    tensor = geometry(tensor, training=True)
+
+    support = tf.cast(tensor > 1.0, tf.float32)
+
+    # Multiplicative gain and gamma preserve a zero background.
+    tensor = tensor * tf.random.uniform([], 0.85, 1.18)
+    tensor = 255.0 * tf.pow(
+        tf.clip_by_value(tensor / 255.0, 0.0, 1.0),
+        tf.random.uniform([], 0.85, 1.15),
+    )
+
+    # Sensor-style noise, masked so the background cannot become grey.
+    noise = tf.random.normal(tf.shape(tensor), mean=0.0, stddev=4.0)
+    tensor = tensor + noise * support
+
+    tensor = _random_erasing(tensor)
+    tensor = tf.clip_by_value(tensor, 0.0, 255.0)
+    return tensor, labels
+
+
+def _enrollment_datasets(
+    images: np.ndarray,
+    labels: np.ndarray,
+    train_indices: np.ndarray,
+    val_indices: np.ndarray,
+    batch_size: int,
+    seed: int,
+):
+    _require_tensorflow()
+    train_images = images[train_indices]
+    train_labels = labels[train_indices]
+    if len(val_indices):
+        val_images = images[val_indices]
+        val_labels = labels[val_indices]
+    else:
+        # Tiny dataset: fall back to reporting the training slice as validation.
+        val_images, val_labels = train_images, train_labels
+
+    geometry = _enrollment_augmentation_layers()
+    train_ds = (
+        tf.data.Dataset.from_tensor_slices((train_images, train_labels))
+        .shuffle(len(train_images), seed=seed, reshuffle_each_iteration=True)
+        .map(
+            lambda image, label: _augment_enrollment_batch(image, label, geometry),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+    val_ds = (
+        tf.data.Dataset.from_tensor_slices((val_images, val_labels))
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
+    train_eval_ds = tf.data.Dataset.from_tensor_slices((train_images, train_labels)).batch(batch_size)
+    return train_ds, val_ds, train_eval_ds, val_images, val_labels
+
+
+def _enrollment_callbacks(models_dir: Path, model_path: Path, patience: int):
+    """Checkpoint on validation loss and stop when it stops improving."""
+    return [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=str(model_path),
+            monitor="val_loss",
+            mode="min",
+            save_best_only=True,
+            verbose=0,
+        ),
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss",
+            mode="min",
+            patience=patience,
+            restore_best_weights=True,
+            verbose=0,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            mode="min",
+            factor=0.5,
+            patience=max(2, patience // 3),
+            min_lr=1e-6,
+            verbose=0,
+        ),
+    ]
+
+
 def retrain_from_enrollments(
     data_dir: Path,
     models_dir: Path,
-    epochs: int = 12,
+    epochs: int = 40,
     architecture: str = "custom_cnn",
+    *,
+    fine_tune_epochs: int = 12,
+    val_fraction: float = 0.2,
 ) -> dict:
-    """Train and persist a child classifier from the enrolled images."""
+    """Train a child classifier from the enrolled images.
+
+    Overfitting is controlled with a per-class validation hold-out, heavy
+    background-preserving augmentation, class weights, early stopping on
+    validation loss, and an optional low-learning-rate fine-tuning phase.
+    """
     _require_tensorflow()
-    if not 1 <= epochs <= 100:
-        raise ValueError("epochs must be between 1 and 100")
+    if not 1 <= epochs <= 200:
+        raise ValueError("epochs must be between 1 and 200")
+    if fine_tune_epochs < 0:
+        raise ValueError("fine_tune_epochs cannot be negative")
     architecture = normalize_architecture_name(architecture)
 
     images, labels, children = load_enrollment_dataset(data_dir)
+    class_count = len(children)
     tf.keras.utils.set_random_seed(42)
 
-    model = build_training_model(len(children), architecture=architecture)
-    if architecture in {"mobilenetv2", "efficientnetb0"}:
-        # With only a handful of enrollment images, train the head first and
-        # keep the ImageNet backbone frozen.
-        try:
-            base = model.get_layer("backbone")
-            base.trainable = False
-        except ValueError:
-            pass
-    callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor="loss", patience=4, restore_best_weights=True
-        )
-    ]
-    history = model.fit(
-        images,  # models consume raw 0–255 RGB and rescale internally
-        labels,
-        batch_size=min(8, len(images)),
-        epochs=epochs,
-        verbose=0,
-        callbacks=callbacks,
+    train_indices, val_indices = _stratified_enrollment_split(
+        labels, val_fraction=val_fraction
+    )
+    if len(train_indices) == 0:
+        raise ValueError("The validation split left no training images.")
+
+    batch_size = int(min(8, max(2, len(train_indices))))
+    train_ds, val_ds, train_eval_ds, val_images, val_labels = _enrollment_datasets(
+        images, labels, train_indices, val_indices, batch_size, seed=42
     )
 
     models_dir.mkdir(parents=True, exist_ok=True)
     model_path = models_dir / "footprint_model.keras"
     classes_path = models_dir / "footprint_model_classes.json"
     meta_path = models_dir / "footprint_model_meta.json"
+
+    model = build_training_model(class_count, architecture=architecture)
+    base_trainable = False
+    if architecture in {"mobilenetv2", "efficientnetb0"}:
+        try:
+            model.get_layer("backbone").trainable = False
+            base_trainable = True
+        except ValueError:
+            base_trainable = False
+
+    # Keras 2.15's SparseCategoricalCrossentropy has no label_smoothing
+    # argument, and a custom smoothing loss would not deserialize in the
+    # classifier's plain load_model() call. Overconfidence is instead handled by
+    # the augmentation, validation-based early stopping and class weights.
+    loss = "sparse_categorical_crossentropy"
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss=loss,
+        metrics=["accuracy"],
+    )
+
+    epochs_completed = 0
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=epochs,
+        callbacks=_enrollment_callbacks(models_dir, model_path, patience=10),
+        class_weight=_class_weights(labels[train_indices], class_count),
+        verbose=0,
+    )
+    epochs_completed += len(history.history.get("loss", []))
+
+    fine_tune_completed = 0
+    if base_trainable and fine_tune_epochs > 0:
+        unfrozen = unfreeze_for_fine_tuning(model, number_of_layers=30)
+        if unfrozen:
+            model.compile(
+                optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+                loss=loss,
+                metrics=["accuracy"],
+            )
+            fine_history = model.fit(
+                train_ds,
+                validation_data=val_ds,
+                epochs=fine_tune_epochs,
+                callbacks=_enrollment_callbacks(models_dir, model_path, patience=6),
+                class_weight=_class_weights(labels[train_indices], class_count),
+                verbose=0,
+            )
+            fine_tune_completed = len(fine_history.history.get("loss", []))
+
+    # Always persist the best checkpoint (lowest validation loss).
+    if model_path.exists():
+        model = tf.keras.models.load_model(model_path)
+
+    train_loss, train_accuracy = model.evaluate(train_eval_ds, verbose=0)
+    if len(val_indices):
+        val_loss, val_accuracy = model.evaluate(val_ds, verbose=0)
+    else:
+        val_loss, val_accuracy = train_loss, train_accuracy
+
     model.save(model_path)
     with classes_path.open("w", encoding="utf-8") as file:
         json.dump(
@@ -176,6 +395,30 @@ def retrain_from_enrollments(
                 "last_conv_layer": find_last_conv_layer(model),
                 "trained_at": datetime.now(timezone.utc).isoformat(),
                 "source": "enrollments",
+                "preprocessing": {
+                    "pipeline": "ROI -> CLAHE -> Gabor -> background suppression",
+                    "background_suppressed": True,
+                },
+                "augmentation": {
+                    "rotation": 0.05,
+                    "translation": 0.10,
+                    "zoom": 0.15,
+                    "gain": [0.85, 1.18],
+                    "gamma": [0.85, 1.15],
+                    "gaussian_noise": 4.0,
+                    "random_erasing": 0.4,
+                },
+                "metrics": {
+                    "train_accuracy": round(float(train_accuracy), 4),
+                    "val_accuracy": round(float(val_accuracy), 4),
+                    "overfit_gap": round(float(train_accuracy) - float(val_accuracy), 4),
+                    "train_loss": round(float(train_loss), 4),
+                    "val_loss": round(float(val_loss), 4),
+                    "train_images": int(len(train_indices)),
+                    "val_images": int(len(val_indices)),
+                    "epochs_completed": int(epochs_completed),
+                    "fine_tune_epochs_completed": int(fine_tune_completed),
+                },
             },
             file,
             indent=2,
@@ -185,8 +428,13 @@ def retrain_from_enrollments(
         "model_path": str(model_path),
         "classes_path": str(classes_path),
         "architecture": architecture,
-        "epochs_completed": len(history.history["loss"]),
-        "training_accuracy": round(float(history.history["accuracy"][-1]) * 100, 2),
+        "epochs_completed": int(epochs_completed),
+        "fine_tune_epochs_completed": int(fine_tune_completed),
+        "training_accuracy": round(float(train_accuracy) * 100, 2),
+        "validation_accuracy": round(float(val_accuracy) * 100, 2),
+        "overfit_gap": round(float(train_accuracy - val_accuracy) * 100, 2),
+        "train_images": int(len(train_indices)),
+        "val_images": int(len(val_indices)),
         "images_used": int(len(images)),
         "children_used": children,
     }
