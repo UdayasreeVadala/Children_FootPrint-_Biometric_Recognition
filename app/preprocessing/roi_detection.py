@@ -91,11 +91,21 @@ def _candidate_masks(image: np.ndarray) -> list[tuple[str, np.ndarray]]:
     return candidates
 
 
+def _local_texture(gray: np.ndarray, kernel_size: int = 15) -> np.ndarray:
+    """Local standard deviation, used to tell creased skin from smooth walls."""
+    values = gray.astype(np.float32)
+    mean = cv2.blur(values, (kernel_size, kernel_size))
+    mean_square = cv2.blur(values * values, (kernel_size, kernel_size))
+    return np.sqrt(np.maximum(mean_square - mean * mean, 0.0))
+
+
 def _score_contour(
     name: str,
     mask: np.ndarray,
     contour: np.ndarray,
     gray: np.ndarray,
+    texture: np.ndarray | None = None,
+    skin: np.ndarray | None = None,
 ) -> float:
     """Heuristic score describing how much a contour looks like a footprint."""
     height, width = mask.shape[:2]
@@ -126,6 +136,28 @@ def _score_contour(
     outside = gray[~mask_bool]
     contrast = abs(float(inside.mean()) - float(outside.mean())) if inside.size and outside.size else 0.0
 
+    # Crease texture: a foot has creases, while a wall/door/floor patch is
+    # smooth.  This is computed inside the contour, not the whole candidate.
+    if texture is None:
+        texture = _local_texture(gray, 15)
+    contour_mask = np.zeros_like(gray)
+    cv2.drawContours(contour_mask, [contour], -1, 255, cv2.FILLED)
+    inside_texture = 0.0
+    if cv2.countNonZero(contour_mask):
+        inside_texture = float(texture[contour_mask > 0].mean())
+    score_texture = 2.0 * min(inside_texture / 20.0, 1.0)
+    if inside_texture < 8.0:
+        score_texture -= 0.8
+    # Skin colour: separates a bare foot from a textured tiled floor.  Combined
+    # with the texture term this gives skin+creases (foot) while rejecting both
+    # the smooth skin-coloured wall and the untextured non-skin floor.
+    score_skin = 0.0
+    if skin is not None and cv2.countNonZero(contour_mask):
+        skin_fraction = float(np.count_nonzero(skin[contour_mask > 0])) / float(
+            cv2.countNonZero(contour_mask)
+        )
+        score_skin = 1.6 * min(1.0, skin_fraction)
+
     # Centre preference: feet are normally near the middle of the capture.
     centre_x = x + box_width / 2.0
     centre_y = y + box_height / 2.0
@@ -148,6 +180,8 @@ def _score_contour(
     elif aspect > 6.0:
         score -= 1.2
     score += 0.9 * min(contrast / 55.0, 1.0)
+    score += score_texture
+    score += score_skin
     score -= 0.6 * min(1.0, centre_distance)
 
     if name.startswith("skin"):
@@ -162,14 +196,27 @@ def _collect_contours(mask: np.ndarray) -> list[np.ndarray]:
     return [contour for contour in contours if cv2.contourArea(contour) >= 100]
 
 
-def _grabcut_mask(image: np.ndarray) -> np.ndarray | None:
-    """Run a quick GrabCut initialised with a generous central rectangle."""
-    height, width = image.shape[:2]
+def _grabcut_mask(image: np.ndarray, margin: float = 0.12) -> np.ndarray | None:
+    """Run GrabCut initialised with a central rectangle.
+
+    The rectangle is inset by ``margin`` on every side, which encodes the
+    assumption that the foot is the dominant object near the middle of a phone
+    capture.  Large images are downscaled first so this stays fast.
+    """
+    scale = 1.0
+    working = image
+    if max(image.shape[:2]) > 700:
+        scale = 700.0 / max(image.shape[:2])
+        working = cv2.resize(
+            image, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA
+        )
+
+    height, width = working.shape[:2]
     mask = np.zeros((height, width), np.uint8)
     background_model = np.zeros((1, 65), np.float64)
     foreground_model = np.zeros((1, 65), np.float64)
-    margin_x = max(2, int(width * 0.03))
-    margin_y = max(2, int(height * 0.03))
+    margin_x = max(2, int(width * margin))
+    margin_y = max(2, int(height * margin))
     rectangle = (
         margin_x,
         margin_y,
@@ -178,18 +225,38 @@ def _grabcut_mask(image: np.ndarray) -> np.ndarray | None:
     )
     try:
         cv2.grabCut(
-            image,
+            working,
             mask,
             rectangle,
             background_model,
             foreground_model,
-            3,
+            5,
             cv2.GC_INIT_WITH_RECT,
         )
     except cv2.error:
         return None
     result = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
-    return _clean_mask(result, 7)
+    result = _clean_mask(result, 7)
+    if scale != 1.0:
+        result = cv2.resize(
+            result, (image.shape[1], image.shape[0]), interpolation=cv2.INTER_NEAREST
+        )
+    return result
+
+
+def _bbox_is_implausible(contour: np.ndarray, shape: tuple[int, int]) -> bool:
+    """True when a contour spans so much of the frame that it is background.
+
+    A wall, door or floor region often wins the area-based score because it is
+    simply big.  A real foot occupies a compact, elongated part of the frame.
+    """
+    height, width = shape[:2]
+    _, _, box_width, box_height = cv2.boundingRect(contour)
+    if box_height >= 0.90 * height or box_width >= 0.90 * width:
+        return True
+    if box_width * box_height >= 0.82 * width * height:
+        return True
+    return False
 
 
 def segment_foot(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, list]:
@@ -215,6 +282,10 @@ def segment_foot(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, list]:
         raise ValueError("ROI detection expects a 3-channel BGR footprint image.")
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    texture = _local_texture(gray, 15)
+    skin_mask = np.zeros(gray.shape, np.uint8)
+    for candidate_skin in _skin_masks(image):
+        skin_mask = cv2.bitwise_or(skin_mask, candidate_skin)
     best: tuple[float, str, np.ndarray, np.ndarray, list] | None = None
 
     for name, raw_mask in _candidate_masks(image):
@@ -222,21 +293,37 @@ def segment_foot(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, list]:
         contours = _collect_contours(cleaned)
         if not contours:
             continue
-        contour = max(contours, key=cv2.contourArea)
-        score = _score_contour(name, cleaned, contour, gray)
-        if best is None or score > best[0]:
-            best = (score, name, cleaned, contour, contours)
+        # The foot is not always the largest blob (a wall can win on area), so
+        # score every significant contour, not just the biggest one.
+        for contour in sorted(contours, key=cv2.contourArea, reverse=True)[:5]:
+            score = _score_contour(
+                name, cleaned, contour, gray, texture=texture, skin=skin_mask
+            )
+            if best is None or score > best[0]:
+                best = (score, name, cleaned, contour, contours)
 
-    # GrabCut is comparatively expensive, so only use it when the cheap masks
-    # do not produce a plausible foot.
-    if best is None or best[0] < 2.5:
+    # GrabCut with a central prior is comparatively expensive, so run it when
+    # the cheap masks are missing, weak, or describe a background-sized region.
+    needs_grabcut = (
+        best is None
+        or best[0] < 2.5
+        or _bbox_is_implausible(best[3], gray.shape)
+    )
+    if needs_grabcut:
         grabcut = _grabcut_mask(image)
         if grabcut is not None:
             contours = _collect_contours(grabcut)
             if contours:
                 contour = max(contours, key=cv2.contourArea)
-                score = _score_contour("grabcut", grabcut, contour, gray)
-                if best is None or score > best[0]:
+                score = _score_contour(
+                    "grabcut", grabcut, contour, gray, texture=texture, skin=skin_mask
+                )
+                use_grabcut = not _bbox_is_implausible(contour, gray.shape) and (
+                    best is None
+                    or _bbox_is_implausible(best[3], gray.shape)
+                    or score > best[0]
+                )
+                if use_grabcut:
                     best = (score, "grabcut", grabcut, contour, contours)
 
     if best is None or best[0] < -1e8:
@@ -266,11 +353,13 @@ def _clamp(value: int, lower: int, upper: int) -> int:
 
 def extract_roi(
     image: np.ndarray, mask: np.ndarray, contour: np.ndarray
-) -> tuple[np.ndarray, dict]:
+) -> tuple[np.ndarray, np.ndarray, dict]:
     """Extract the midfoot/arch ROI (40%–75% of the foot bounding box).
 
-    Returns the masked 224×224 ROI and a dictionary describing the anatomical
-    partitions, including the original bounding box of the foot.
+    Returns the masked 224×224 ROI, the matching 224×224 foot-support mask and
+    a dictionary describing the anatomical partitions, including the original
+    bounding box of the foot.  The support mask is what lets later stages keep
+    creases while hard-zeroing everything that is not foot.
     """
     x, y, width, height = cv2.boundingRect(contour)
     if width < 2 or height < 2:
@@ -292,6 +381,8 @@ def extract_roi(
     if roi_masked.size == 0:
         raise ValueError("The computed ROI is empty.")
     roi_resized = cv2.resize(roi_masked, (224, 224), interpolation=cv2.INTER_AREA)
+    roi_mask = cv2.resize(mask_crop, (224, 224), interpolation=cv2.INTER_NEAREST)
+    roi_mask = (roi_mask > 0).astype(np.uint8) * 255
 
     region_info = {
         "bounding_box": (x, y, width, height),
@@ -300,7 +391,7 @@ def extract_roi(
         "heel_y": heel_y,
         "roi_bounds": (roi_x_start, roi_y_start, roi_x_end - roi_x_start, roi_y_end - roi_y_start),
     }
-    return roi_resized, region_info
+    return roi_resized, roi_mask, region_info
 
 
 def visualize_regions(
@@ -376,10 +467,11 @@ def process_footprint(
 
         mask, cleaned_threshold, contours = segment_foot(image)
         largest_contour = max(contours, key=cv2.contourArea)
-        roi, region_info = extract_roi(image, mask, largest_contour)
+        roi, roi_mask, region_info = extract_roi(image, mask, largest_contour)
 
         result = {
             "roi": roi,
+            "roi_mask": roi_mask,
             "mask": mask,
             "threshold": cleaned_threshold,
             "region_info": region_info,

@@ -20,7 +20,9 @@ train_log*.txt
 .DS_Store
 Thumbs.db
 Training_Data.zip
- 
- 
+
 # Local pre-migration backups of enrolled images
 data/enrolled_backup*/
+
+# Generated augmented dataset (see export_augmented.py)
+data/augmented*/

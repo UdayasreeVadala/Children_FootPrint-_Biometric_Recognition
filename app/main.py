@@ -264,10 +264,12 @@ def _preprocess_upload(image: np.ndarray) -> dict:
 
     roi_result = process_footprint(image, return_visualization=True)
     roi_image = roi_result["roi"]
+    roi_mask = roi_result.get("roi_mask")
     enhancement = enhance_footprint(roi_image)
-    focused = focus_on_creases(enhancement["enhanced"])
+    focused = focus_on_creases(enhancement["enhanced"], mask=roi_mask)
     return {
         "roi": roi_image,
+        "roi_mask": roi_mask,
         "enhanced": focused,
         "clahe": enhancement.get("clahe"),
         "gabor_fused": enhancement.get("gabor_fused"),
@@ -390,13 +392,15 @@ async def identify_footprint(file: UploadFile = File(...)):
     try:
         roi_result = process_footprint(image, return_visualization=True)
         roi_image = roi_result["roi"]
+        roi_mask = roi_result.get("roi_mask")
         roi_viz = roi_result.get("visualization")
     except Exception:
         roi_image = cv2.resize(image, (224, 224))
+        roi_mask = None
         roi_viz = None
 
     enhanced_image = enhance_footprint(roi_image)["enhanced"]
-    enhanced_image = focus_on_creases(enhanced_image)
+    enhanced_image = focus_on_creases(enhanced_image, mask=roi_mask)
 
     classifier = _get_classifier()
     prediction = classifier.predict(enhanced_image)
@@ -732,8 +736,8 @@ async def model_info():
 # ---------------------------------------------------------------------------
 @app.post("/api/retrain")
 def retrain_model(
-    epochs: int = Query(default=40, ge=1, le=200),
-    architecture: str = Query(default="custom_cnn"),
+    epochs: int = Query(default=150, ge=1, le=200),
+    architecture: str = Query(default="mobilenetv2"),
     fine_tune_epochs: int = Query(default=12, ge=0, le=50),
 ):
     """Train a child-identity model from the preprocessed enrolled-image folders.

@@ -245,6 +245,25 @@ def estimate_pattern_mask(
         )
         gate = cv2.dilate(gate, kernel, iterations=1)
 
+    # Drop small speckle patches from background texture, keeping every
+    # component that is at least 5% of the largest one (toes/heel fragments).
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(gate, 8)
+    if count > 1:
+        largest = int(np.max(stats[1:, cv2.CC_STAT_AREA]))
+        keep = np.zeros_like(gate)
+        for index in range(1, count):
+            if stats[index, cv2.CC_STAT_AREA] >= 0.05 * largest:
+                keep[labels == index] = 255
+        gate = keep
+
+    # Fill interior holes so the support describes the whole foot region
+    # instead of a sieve of individual creases.
+    contours, _ = cv2.findContours(gate, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if contours:
+        filled = np.zeros_like(gate)
+        cv2.drawContours(filled, contours, -1, 255, cv2.FILLED)
+        gate = filled
+
     if cv2.countNonZero(gate) < 64:
         return full
     return gate
@@ -258,6 +277,7 @@ def focus_on_creases(
     high: float = 98.0,
     soft: float = 3.0,
     normalise: bool = True,
+    min_foreground: float = 0.10,
 ) -> np.ndarray:
     """Keep only the crease pattern and force the background to pure black.
 
@@ -276,6 +296,10 @@ def focus_on_creases(
         low, high: Percentiles used for the contrast stretch.
         soft: Gaussian sigma used to feather the mask. ``0`` keeps it hard.
         normalise: Set to ``False`` to only mask, without rescaling.
+        min_foreground: Minimum fraction of non-black pixels the result must
+            keep. If crease gating leaves the image almost blank, progressively
+            wider supports (foot mask, then texture support) are tried so the
+            classifier always receives a usable pattern.
 
     Returns:
         ``uint8`` grayscale image with a black background.
@@ -283,41 +307,71 @@ def focus_on_creases(
     gray = image if image.ndim == 2 else cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = gray.astype(np.uint8, copy=False)
 
+    texture_support = estimate_pattern_mask(gray)
+    foot_support = None
     if mask is None:
-        mask = estimate_pattern_mask(gray)
+        support = texture_support
+        fallbacks: list[np.ndarray] = []
     else:
-        mask = (np.asarray(mask) > 0).astype(np.uint8) * 255
-        if mask.shape != gray.shape:
-            mask = cv2.resize(
-                mask, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST
+        foot_support = (np.asarray(mask) > 0).astype(np.uint8) * 255
+        if foot_support.shape != gray.shape:
+            foot_support = cv2.resize(
+                foot_support,
+                (gray.shape[1], gray.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
             )
+        # Stage 1 is the geometric foot mask, stage 2 is crease evidence.
+        support = cv2.bitwise_and(texture_support, foot_support)
+        if cv2.countNonZero(support) < 0.15 * max(1, cv2.countNonZero(foot_support)):
+            # Too little crease evidence inside the foot: trust the foot mask.
+            support = foot_support
+        # Progressive back-off if the focused result is nearly blank.
+        fallbacks = [foot_support, texture_support]
 
-    if cv2.countNonZero(mask) < 32:
-        return gray.copy()
+    def _render(support_mask: np.ndarray) -> np.ndarray:
+        if cv2.countNonZero(support_mask) < 32:
+            return gray.copy()
+        if soft and soft > 0:
+            weight = cv2.GaussianBlur(support_mask, (0, 0), soft).astype(np.float32) / 255.0
+        else:
+            weight = support_mask.astype(np.float32) / 255.0
 
-    if soft and soft > 0:
-        weight = cv2.GaussianBlur(mask, (0, 0), soft).astype(np.float32) / 255.0
-    else:
-        weight = mask.astype(np.float32) / 255.0
+        focused = gray.astype(np.float32) * weight
+        if not normalise:
+            return np.clip(focused, 0.0, 255.0).astype(np.uint8)
 
-    focused = gray.astype(np.float32) * weight
-    if not normalise:
-        return np.clip(focused, 0.0, 255.0).astype(np.uint8)
+        inside = weight > 0.5
+        values = focused[inside]
+        if values.size < 32:
+            return np.clip(focused, 0.0, 255.0).astype(np.uint8)
 
-    inside = weight > 0.5
-    values = focused[inside]
-    if values.size < 32:
-        return np.clip(focused, 0.0, 255.0).astype(np.uint8)
+        low_value = float(np.percentile(values, low))
+        high_value = float(np.percentile(values, high))
+        if high_value - low_value < 1e-3:
+            return np.clip(focused, 0.0, 255.0).astype(np.uint8)
 
-    low_value = float(np.percentile(values, low))
-    high_value = float(np.percentile(values, high))
-    if high_value - low_value < 1e-3:
-        return np.clip(focused, 0.0, 255.0).astype(np.uint8)
+        stretched = (focused - low_value) * (255.0 / (high_value - low_value))
+        # Re-apply the weight so feathered edges and the background stay black.
+        stretched = np.clip(stretched, 0.0, 255.0) * weight
+        return stretched.astype(np.uint8)
 
-    focused = (focused - low_value) * (255.0 / (high_value - low_value))
-    # Re-apply the weight so feathered edges and the background stay black.
-    focused = np.clip(focused, 0.0, 255.0) * weight
-    return focused.astype(np.uint8)
+    def _foreground_fraction(candidate: np.ndarray) -> float:
+        return cv2.countNonZero(candidate) / float(candidate.size)
+
+    focused = _render(support)
+    if min_foreground > 0.0 and _foreground_fraction(focused) < min_foreground:
+        # The crease gate starved the pattern: widen the support rather than
+        # handing the classifier an almost-black image.
+        widest = focused
+        for fallback in fallbacks:
+            candidate = _render(fallback)
+            if _foreground_fraction(candidate) > _foreground_fraction(widest):
+                widest = candidate
+            if _foreground_fraction(candidate) >= min_foreground:
+                return candidate
+        return widest
+
+    return focused
 
 
 def get_enhancement_visualization(

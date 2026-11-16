@@ -16,6 +16,7 @@ and serve static pages when the ML stack is unavailable.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import time
@@ -74,6 +75,7 @@ def load_enrollment_dataset(data_dir: Path) -> tuple[np.ndarray, np.ndarray, lis
         children = json.load(file).get("children", [])
 
     images, labels, usable_children = [], [], []
+    seen_hashes: set[str] = set()
     for child in children:
         child_id = child.get("child_id")
         if not child_id:
@@ -89,6 +91,12 @@ def load_enrollment_dataset(data_dir: Path) -> tuple[np.ndarray, np.ndarray, lis
             image = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
             if image is None:
                 continue
+            # Byte-identical repeats (re-enrolment of the same capture) only
+            # double-weight a class and make the validation split misleading.
+            digest = hashlib.sha1(image.tobytes()).hexdigest()
+            if digest in seen_hashes:
+                continue
+            seen_hashes.add(digest)
             image = cv2.resize(image, (224, 224), interpolation=cv2.INTER_AREA)
             images.append(cv2.cvtColor(image, cv2.COLOR_GRAY2RGB))
             labels.append(class_index)
@@ -147,11 +155,11 @@ def _stratified_enrollment_split(
 
 
 def _enrollment_augmentation_layers() -> "tf.keras.Sequential":
-    """Geometric augmentation that keeps the background at exactly zero."""
+    """Heavy geometric augmentation that keeps the background at exactly zero."""
     _require_tensorflow()
     return tf.keras.Sequential(
         [
-            tf.keras.layers.RandomRotation(0.05, fill_mode="constant", fill_value=0.0),
+            tf.keras.layers.RandomRotation(0.06, fill_mode="constant", fill_value=0.0),
             tf.keras.layers.RandomTranslation(0.10, 0.10, fill_mode="constant", fill_value=0.0),
             tf.keras.layers.RandomZoom(0.15, 0.15, fill_mode="constant", fill_value=0.0),
         ],
@@ -159,11 +167,11 @@ def _enrollment_augmentation_layers() -> "tf.keras.Sequential":
     )
 
 
-def _random_erasing(images, probability: float = 0.4):
-    """Blank a random rectangle to stop the head memorising fixed crease spots."""
+def _single_random_erasing(images, probability: float):
+    """Blank one random rectangle to stop the head memorising fixed crease spots."""
     height = tf.shape(images)[0]
     width = tf.shape(images)[1]
-    box_fraction = tf.random.uniform([], 0.08, 0.25)
+    box_fraction = tf.random.uniform([], 0.06, 0.22)
     box_height = tf.cast(tf.cast(height, tf.float32) * box_fraction, tf.int32)
     box_width = tf.cast(tf.cast(width, tf.float32) * box_fraction, tf.int32)
     top = tf.random.uniform([], 0, tf.maximum(1, height - box_height), dtype=tf.int32)
@@ -183,11 +191,19 @@ def _random_erasing(images, probability: float = 0.4):
     return images * keep[..., None]
 
 
+def _random_erasing(images, probability: float = 0.5, boxes: int = 2):
+    """Apply several independent erasing boxes per sample."""
+    for _ in range(max(1, boxes)):
+        images = _single_random_erasing(images, probability)
+    return images
+
+
 def _augment_enrollment_batch(images, labels, geometry):
     """Heavy augmentation for a single image (called from ``tf.data``).
 
-    Gain, gamma and noise are all applied in a way that leaves the suppressed
-    background at exactly ``0``, so the network still never sees background.
+    Geometry, gain, gamma, noise, crease dropout and erasing are all applied in
+    a way that leaves the suppressed background at exactly ``0``, so the
+    network still never sees background.
     """
     tensor = tf.cast(images, tf.float32)
     tensor = geometry(tensor, training=True)
@@ -195,17 +211,23 @@ def _augment_enrollment_batch(images, labels, geometry):
     support = tf.cast(tensor > 1.0, tf.float32)
 
     # Multiplicative gain and gamma preserve a zero background.
-    tensor = tensor * tf.random.uniform([], 0.85, 1.18)
+    tensor = tensor * tf.random.uniform([], 0.85, 1.20)
     tensor = 255.0 * tf.pow(
         tf.clip_by_value(tensor / 255.0, 0.0, 1.0),
-        tf.random.uniform([], 0.85, 1.15),
+        tf.random.uniform([], 0.85, 1.20),
     )
 
     # Sensor-style noise, masked so the background cannot become grey.
-    noise = tf.random.normal(tf.shape(tensor), mean=0.0, stddev=4.0)
+    noise = tf.random.normal(tf.shape(tensor), mean=0.0, stddev=5.0)
     tensor = tensor + noise * support
 
-    tensor = _random_erasing(tensor)
+    # Random crease dropout: keep 90-100% of foreground pixels, never the
+    # background (support == 0 forces the multiplier to 1 there).
+    keep_probability = tf.random.uniform([], 0.90, 1.0)
+    keep = tf.cast(tf.random.uniform(tf.shape(tensor)) < keep_probability, tf.float32)
+    tensor = tensor * tf.maximum(keep, 1.0 - support)
+
+    tensor = _random_erasing(tensor, probability=0.35, boxes=2)
     tensor = tf.clip_by_value(tensor, 0.0, 255.0)
     return tensor, labels
 
@@ -248,26 +270,37 @@ def _enrollment_datasets(
     return train_ds, val_ds, train_eval_ds, val_images, val_labels
 
 
-def _enrollment_callbacks(models_dir: Path, model_path: Path, patience: int):
-    """Checkpoint on validation loss and stop when it stops improving."""
+def _enrollment_callbacks(
+    models_dir: Path,
+    model_path: Path,
+    patience: int,
+    monitor: str = "val_accuracy",
+    mode: str = "max",
+):
+    """Checkpoint on validation accuracy and stop when it stops improving.
+
+    Validation loss is a poor selection signal for this tiny enrolment set: it
+    keeps falling while the model still confuses whole classes.  Selecting on
+    accuracy checkpoints the model that actually recognises children.
+    """
     return [
         tf.keras.callbacks.ModelCheckpoint(
             filepath=str(model_path),
-            monitor="val_loss",
-            mode="min",
+            monitor=monitor,
+            mode=mode,
             save_best_only=True,
             verbose=0,
         ),
         tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            mode="min",
+            monitor=monitor,
+            mode=mode,
             patience=patience,
             restore_best_weights=True,
             verbose=0,
         ),
         tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="val_loss",
-            mode="min",
+            monitor=monitor,
+            mode=mode,
             factor=0.5,
             patience=max(2, patience // 3),
             min_lr=1e-6,
@@ -279,10 +312,11 @@ def _enrollment_callbacks(models_dir: Path, model_path: Path, patience: int):
 def retrain_from_enrollments(
     data_dir: Path,
     models_dir: Path,
-    epochs: int = 40,
-    architecture: str = "custom_cnn",
+    epochs: int = 150,
+    architecture: str = "mobilenetv2",
     *,
     fine_tune_epochs: int = 12,
+    fine_tune_learning_rate: float = 1e-5,
     val_fraction: float = 0.2,
 ) -> dict:
     """Train a child classifier from the enrolled images.
@@ -343,7 +377,7 @@ def retrain_from_enrollments(
         train_ds,
         validation_data=val_ds,
         epochs=epochs,
-        callbacks=_enrollment_callbacks(models_dir, model_path, patience=10),
+        callbacks=_enrollment_callbacks(models_dir, model_path, patience=20),
         class_weight=_class_weights(labels[train_indices], class_count),
         verbose=0,
     )
@@ -354,7 +388,7 @@ def retrain_from_enrollments(
         unfrozen = unfreeze_for_fine_tuning(model, number_of_layers=30)
         if unfrozen:
             model.compile(
-                optimizer=tf.keras.optimizers.Adam(learning_rate=1e-5),
+                optimizer=tf.keras.optimizers.Adam(learning_rate=fine_tune_learning_rate),
                 loss=loss,
                 metrics=["accuracy"],
             )
@@ -362,7 +396,7 @@ def retrain_from_enrollments(
                 train_ds,
                 validation_data=val_ds,
                 epochs=fine_tune_epochs,
-                callbacks=_enrollment_callbacks(models_dir, model_path, patience=6),
+                callbacks=_enrollment_callbacks(models_dir, model_path, patience=12),
                 class_weight=_class_weights(labels[train_indices], class_count),
                 verbose=0,
             )
@@ -400,13 +434,14 @@ def retrain_from_enrollments(
                     "background_suppressed": True,
                 },
                 "augmentation": {
-                    "rotation": 0.05,
+                    "rotation": 0.06,
                     "translation": 0.10,
                     "zoom": 0.15,
-                    "gain": [0.85, 1.18],
-                    "gamma": [0.85, 1.15],
-                    "gaussian_noise": 4.0,
-                    "random_erasing": 0.4,
+                    "gain": [0.85, 1.20],
+                    "gamma": [0.85, 1.20],
+                    "gaussian_noise": 5.0,
+                    "crease_dropout": [0.90, 1.0],
+                    "random_erasing": {"probability": 0.35, "boxes": 2},
                 },
                 "metrics": {
                     "train_accuracy": round(float(train_accuracy), 4),
@@ -747,6 +782,59 @@ def _class_weights(labels: np.ndarray, class_count: int) -> dict[int, float]:
     return {
         index: float(total / (class_count * count))
         for index, count in enumerate(counts)
+    }
+
+
+def export_augmented_dataset(
+    data_dir: Path,
+    output_dir: Path,
+    copies_per_image: int = 10,
+    *,
+    seed: int = 42,
+) -> dict:
+    """Materialise augmented copies of the enrolled images on disk.
+
+    Training itself uses on-the-fly augmentation (see ``_enrollment_datasets``),
+    so this helper is for inspection, sharing or external tools.  Every copy is
+    a fresh random variant produced by the exact same augmentation pipeline that
+    training uses.
+    """
+    _require_tensorflow()
+    if copies_per_image < 1:
+        raise ValueError("copies_per_image must be at least 1")
+
+    images, labels, children = load_enrollment_dataset(data_dir)
+    tf.keras.utils.set_random_seed(seed)
+    geometry = _enrollment_augmentation_layers()
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written = 0
+    per_child: dict[str, int] = {}
+
+    for class_index, child in enumerate(children):
+        child_id = child["child_id"]
+        child_dir = output_dir / child_id
+        child_dir.mkdir(parents=True, exist_ok=True)
+        for index in np.where(labels == class_index)[0]:
+            source = tf.constant(images[index])
+            for copy_index in range(copies_per_image):
+                augmented, _ = _augment_enrollment_batch(
+                    source, tf.constant(class_index, dtype=tf.int32), geometry
+                )
+                array = np.clip(augmented.numpy(), 0.0, 255.0).astype(np.uint8)
+                path = child_dir / f"{child_id}_{int(index):03d}_aug{copy_index:02d}.png"
+                if cv2.imwrite(str(path), cv2.cvtColor(array, cv2.COLOR_RGB2GRAY)):
+                    written += 1
+                    per_child[child_id] = per_child.get(child_id, 0) + 1
+
+    return {
+        "output_dir": str(output_dir),
+        "children": len(children),
+        "source_images": int(len(images)),
+        "copies_per_image": int(copies_per_image),
+        "images_written": written,
+        "per_child": per_child,
     }
 
 
