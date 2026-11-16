@@ -674,7 +674,9 @@
         retrainBtn().disabled = true;
         showLoading(retrainLoading());
         try {
-            const response = await fetch('/api/retrain?epochs=12', { method: 'POST' });
+            // Use the server defaults (MobileNetV2, 150 epochs, 12 fine-tune
+            // epochs); overriding epochs here previously produced weak models.
+            const response = await fetch('/api/retrain', { method: 'POST' });
             const data = await response.json();
             if (!response.ok || !data.success) {
                 throw new Error(data.detail || 'Training could not be started.');
