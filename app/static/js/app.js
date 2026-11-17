@@ -615,13 +615,54 @@
                 deleteBtn.title = `Remove ${child.child_name || child.child_id}`;
                 deleteBtn.setAttribute('aria-label', `Delete ${child.child_name || child.child_id}`);
                 deleteBtn.addEventListener('click', () => deleteChild(child.child_id));
-                item.appendChild(deleteBtn);
+
+                const renameBtn = document.createElement('button');
+                renameBtn.className = 'btn-ghost-sm';
+                renameBtn.innerHTML = '✎';
+                renameBtn.title = `Rename ${child.child_name || child.child_id}`;
+                renameBtn.setAttribute('aria-label', `Rename ${child.child_name || child.child_id}`);
+                renameBtn.addEventListener('click', () => renameChild(child));
+
+                const actions = document.createElement('div');
+                actions.className = 'child-actions';
+                actions.append(renameBtn, deleteBtn);
+                item.appendChild(actions);
                 container.appendChild(item);
             });
         } catch (error) {
             console.error('Failed to fetch enrolled list:', error);
             container.innerHTML = '<p class="empty-state">Could not load enrolled children.</p>';
         }
+    }
+
+    async function renameChild(child) {
+        const currentName = child.child_name || child.child_id;
+        const entered = prompt(
+            `New name for ${currentName} (${child.child_id}):`,
+            currentName
+        );
+        if (entered === null) return;
+
+        const newName = entered.trim();
+        if (!newName || newName === currentName) return;
+
+        try {
+            const response = await fetch(
+                `/api/enrolled/${encodeURIComponent(child.child_id)}/name`,
+                {
+                    method: 'PATCH',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ child_name: newName }),
+                }
+            );
+            const data = await response.json();
+            if (!response.ok) throw new Error(data.detail || 'Rename failed.');
+        } catch (error) {
+            console.error('Rename error:', error);
+            alert(error.message || 'Could not rename this child.');
+        }
+        refreshEnrolledList();
+        refreshModelInfo();
     }
 
     async function deleteChild(childId) {

@@ -22,7 +22,7 @@ from typing import Any
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.requests import Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -127,6 +127,7 @@ def _get_classifier():
             _classifier = classifier
             if classifier.is_demo or not classifier.class_records:
                 _sync_demo_class_names()
+            _apply_enrollment_names()
             try:
                 classifier.refresh_enrollment_index()
             except Exception:
@@ -152,6 +153,29 @@ def _sync_demo_class_names() -> None:
             }
     if class_records:
         _classifier.update_class_records(class_records)
+
+
+def _apply_enrollment_names() -> None:
+    """Overlay the names stored in ``metadata.json`` onto the model labels.
+
+    Models trained before a rename only contain ``CHILD_xxx`` ids, so without
+    this the result card would still show the id after the child was renamed.
+    """
+    classifier = _classifier
+    if classifier is None:
+        return
+    meta_path = DATA_DIR / "metadata.json"
+    if not meta_path.exists():
+        return
+    try:
+        with meta_path.open("r", encoding="utf-8") as file:
+            metadata = json.load(file)
+    except (OSError, ValueError):
+        return
+    for child in metadata.get("children", []):
+        child_id = str(child.get("child_id", "")).strip()
+        if child_id:
+            classifier.rename_child(child_id, child.get("child_name") or child_id)
 
 
 def _warm_up_classifier() -> None:
@@ -212,6 +236,37 @@ def _save_metadata(child_id: str, child_name: str, image_count: int) -> None:
     _sync_demo_class_names()
     if _classifier is not None and not _classifier.is_demo:
         _classifier.refresh_enrollment_index(force=True)
+
+
+def _rename_enrolled_child(child_id: str, child_name: str) -> dict:
+    """Update a child's display name in ``metadata.json``, atomically.
+
+    Only the label changes: the ``CHILD_xxx`` id, the image folder and the
+    trained model all stay as they are, so no retraining is required.
+    """
+    child_name, child_id = _validate_child_details(child_name, child_id)
+    meta_path = DATA_DIR / "metadata.json"
+    if not meta_path.exists():
+        raise HTTPException(status_code=404, detail="No children are enrolled yet")
+
+    with meta_path.open("r", encoding="utf-8") as file:
+        metadata = json.load(file)
+
+    for child in metadata.get("children", []):
+        if child.get("child_id") == child_id:
+            previous_name = str(child.get("child_name", child_id))
+            child["child_name"] = child_name
+            temporary_path = meta_path.with_suffix(".tmp")
+            with temporary_path.open("w", encoding="utf-8") as file:
+                json.dump(metadata, file, indent=2)
+            temporary_path.replace(meta_path)
+            return {
+                "child_id": child_id,
+                "child_name": child_name,
+                "previous_name": previous_name,
+            }
+
+    raise HTTPException(status_code=404, detail=f"{child_id} is not enrolled")
 
 
 def _numpy_to_base64(image: np.ndarray | None, *, rgb: bool = False) -> str:
@@ -558,6 +613,21 @@ async def delete_enrolled(child_id: str):
     if _classifier is not None and not _classifier.is_demo:
         _classifier.refresh_enrollment_index(force=True)
     return JSONResponse({"success": True, "message": f"Child {child_id} removed"})
+
+
+@app.patch("/api/enrolled/{child_id}/name")
+async def rename_enrolled(child_id: str, payload: dict = Body(...)):
+    """Rename an enrolled child without retraining or touching their images."""
+    raw_name = payload.get("child_name") if isinstance(payload, dict) else None
+    if raw_name is None:
+        raise HTTPException(status_code=400, detail="child_name is required")
+
+    result = _rename_enrolled_child(child_id, str(raw_name))
+    if _classifier is not None:
+        if _classifier.is_demo:
+            _sync_demo_class_names()
+        _classifier.rename_child(result["child_id"], result["child_name"])
+    return JSONResponse({"success": True, **result})
 
 
 # ---------------------------------------------------------------------------

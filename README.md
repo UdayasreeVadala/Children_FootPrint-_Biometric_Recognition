@@ -237,6 +237,7 @@ enrolled-child count, with a shortcut to the Model Lab.
 | `POST` | `/api/enroll` | Enroll one child with one or more images. |
 | `POST` | `/api/identify` | Identify one image; returns prediction, top three, similarity, preprocessing, and Grad-CAM. |
 | `GET` | `/api/enrolled` | List enrolled children and actual image counts. |
+| `PATCH` | `/api/enrolled/{child_id}/name` | Rename an enrolled child (display name only). |
 | `DELETE` | `/api/enrolled/{child_id}` | Remove an enrolled child and their images. |
 | `POST` | `/api/preprocess-preview` | Return original/ROI/CLAHE/Gabor previews. |
 | `POST` | `/api/retrain?epochs=12&architecture=custom_cnn` | Train an identity model from enrolled images. |
@@ -247,6 +248,26 @@ enrolled-child count, with a shortcut to the Model Lab.
 | `POST` | `/api/train?architectures=…&epochs=…` | Start background dataset training. |
 | `GET` | `/api/train/status` | Training stage, progress events, error/result. |
 | `POST` | `/api/enroll-sample?subject=B003&limit=12` | Enroll a subject from the bundled dataset for a quick demo. |
+
+### Renaming children
+
+A child has a fixed `child_id` (`CHILD_001`, also the model class and image
+folder name) and a display `child_name`. Only the name changes when you rename;
+the images, the id and the trained model stay as they are, so **no retraining is
+needed**.
+
+Rename one child from the UI (pencil button in the enrolled list), or all of
+them from a name sheet:
+
+```powershell
+python rename_children.py --list
+python rename_children.py --file child_names.csv --dry-run
+python rename_children.py --file child_names.csv
+```
+
+`child_names.csv` holds `child_id,name` rows; the second column can also be the
+current name (`B008`) instead of the id. Use `--mapping "B008=Aarav,B035=Meera"`
+for a few inline changes.
 
 ### Configuration
 

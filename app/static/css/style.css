@@ -565,6 +565,35 @@ body::after {
     color: #fff;
 }
 
+.child-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.btn-ghost-sm {
+    width: 24px;
+    height: 24px;
+    border-radius: 50%;
+    border: 1px solid var(--border-subtle);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 0.72rem;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: all var(--transition-fast);
+    flex-shrink: 0;
+}
+
+.btn-ghost-sm:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+    border-color: var(--accent-teal);
+}
+
 /* ---------- LOADING ---------- */
 .loading-container {
     display: flex;

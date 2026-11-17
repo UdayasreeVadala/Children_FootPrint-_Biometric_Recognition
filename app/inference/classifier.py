@@ -236,6 +236,20 @@ class FootprintClassifier:
         """Backward-compatible shorthand for callers that pass names only."""
         self.update_class_records(class_names)
 
+    def rename_child(self, child_id: str, child_name: str) -> None:
+        """Change a child's display name without reloading the model.
+
+        The ``child_id`` stays fixed because it is the model class label; only
+        the human-readable name shown in results changes.
+        """
+        child_id = str(child_id)
+        child_name = str(child_name)
+        for record in self.class_records.values():
+            if str(record.get("child_id", "")) == child_id:
+                record["child_name"] = child_name
+        if child_id in self._child_records:
+            self._child_records[child_id]["child_name"] = child_name
+
     # ------------------------------------------------------------------
     # Image preparation
     # ------------------------------------------------------------------

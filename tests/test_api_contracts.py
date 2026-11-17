@@ -22,6 +22,7 @@ class TestApiContracts(unittest.TestCase):
             ("/api/identify", ("POST",)),
             ("/api/enrolled", ("GET",)),
             ("/api/enrolled/{child_id}", ("DELETE",)),
+            ("/api/enrolled/{child_id}/name", ("PATCH",)),
             ("/api/retrain", ("POST",)),
             ("/api/preprocess-preview", ("POST",)),
             ("/api/dataset-info", ("GET",)),

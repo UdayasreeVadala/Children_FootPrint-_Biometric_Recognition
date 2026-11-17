@@ -24,5 +24,8 @@ Training_Data.zip
 # Local pre-migration backups of enrolled images
 data/enrolled_backup*/
 
+# Local name sheet (personal data)
+child_names.csv
+
 # Generated augmented dataset (see export_augmented.py)
 data/augmented*/
