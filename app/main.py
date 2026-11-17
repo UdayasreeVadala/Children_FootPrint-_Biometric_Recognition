@@ -709,8 +709,12 @@ def dataset_info():
 # API: Model registry and selection
 # ---------------------------------------------------------------------------
 @app.get("/api/models")
-async def list_models():
-    """Return the trained-model registry and the comparison metrics."""
+def list_models():
+    """Return the trained-model registry and the comparison metrics.
+
+    Sync on purpose: ``_get_classifier()`` can load the Keras model on a cold
+    start, which must not happen inside the event loop.
+    """
     registry_path = MODELS_DIR / "registry.json"
     if not registry_path.exists():
         return JSONResponse(
@@ -811,8 +815,12 @@ async def select_model(architecture: str = Query(..., min_length=1)):
 # API: Model information
 # ---------------------------------------------------------------------------
 @app.get("/api/model-info")
-async def model_info():
-    """Return information about the loaded model."""
+def model_info():
+    """Return information about the loaded model.
+
+    Sync on purpose: on a cold start this waits for the background model load,
+    and blocking the event loop here used to kill the Windows accept loop.
+    """
     classifier = _get_classifier()
     return JSONResponse(classifier.get_model_info())
 
