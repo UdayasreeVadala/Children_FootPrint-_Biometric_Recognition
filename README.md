@@ -42,7 +42,8 @@ uvicorn app.main:app --reload
 ```
 
 Open `http://127.0.0.1:8000`. The lightweight health check is
-`http://127.0.0.1:8000/api/health`.
+`http://127.0.0.1:8000/api/health` (also exposed as `/health` for uptime
+probes).
 
 The application starts even before training: it falls back to a clearly labelled
 demo mode. Once `models/registry.json` exists, the best trained model is loaded

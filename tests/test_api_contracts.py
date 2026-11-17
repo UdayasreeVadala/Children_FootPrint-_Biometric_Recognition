@@ -17,6 +17,7 @@ class TestApiContracts(unittest.TestCase):
         expected = {
             ("/", ("GET",)),
             ("/api/health", ("GET",)),
+            ("/health", ("GET",)),
             ("/api/enroll", ("POST",)),
             ("/api/identify", ("POST",)),
             ("/api/enrolled", ("GET",)),

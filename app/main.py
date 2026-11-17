@@ -71,12 +71,19 @@ async def health_check():
     }
 
 
+@app.get("/health", include_in_schema=False)
+async def health_alias():
+    """Alias for ``/api/health`` used by external uptime checks."""
+    return await health_check()
+
+
 # ---------------------------------------------------------------------------
 # Lazy-loaded classifier state
 # ---------------------------------------------------------------------------
 _classifier = None
 _CLASSIFIER_LOCK = threading.Lock()
 _TRAINING_LOCK = threading.Lock()
+_RETRAIN_LOCK = threading.Lock()
 _TRAINING_STATE: dict[str, Any] = {
     "running": False,
     "stage": "idle",
@@ -752,31 +759,42 @@ def retrain_model(
     from app.inference.architectures import normalize_architecture_name
     from app.inference.training import retrain_from_enrollments
 
-    try:
-        architecture = normalize_architecture_name(architecture)
-        result = retrain_from_enrollments(
-            DATA_DIR,
-            MODELS_DIR,
-            epochs=epochs,
-            architecture=architecture,
-            fine_tune_epochs=fine_tune_epochs,
+    # Two concurrent retrains would train in different threadpool threads and
+    # overwrite the same checkpoint files, leaving a half-trained model behind.
+    if not _RETRAIN_LOCK.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="A retrain is already running; wait for it to finish.",
         )
-    except ValueError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-
-    # Make the freshly trained identity model active, even if a dataset
-    # registry from the three-architecture comparison already exists.
-    _activate_enrollment_model(result, architecture)
-    _classifier = None
-    # Reload immediately so /api/health keeps reporting model_loaded: true and
-    # the first identification after retraining does not pay the load cost.
     try:
-        _get_classifier()
-    except Exception:  # pragma: no cover - best effort warm-up
-        pass
-    return JSONResponse({"success": True, **result})
+        try:
+            architecture = normalize_architecture_name(architecture)
+            result = retrain_from_enrollments(
+                DATA_DIR,
+                MODELS_DIR,
+                epochs=epochs,
+                architecture=architecture,
+                fine_tune_epochs=fine_tune_epochs,
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except RuntimeError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+        # Make the freshly trained identity model active, even if a dataset
+        # registry from the three-architecture comparison already exists.
+        _activate_enrollment_model(result, architecture)
+        _classifier = None
+        # Reload immediately so /api/health keeps reporting model_loaded: true
+        # and the first identification after retraining does not pay the load
+        # cost.
+        try:
+            _get_classifier()
+        except Exception:  # pragma: no cover - best effort warm-up
+            pass
+        return JSONResponse({"success": True, **result})
+    finally:
+        _RETRAIN_LOCK.release()
 
 
 def _activate_enrollment_model(result: dict, architecture: str) -> None:

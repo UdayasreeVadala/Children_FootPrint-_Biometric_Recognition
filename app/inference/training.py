@@ -270,6 +270,25 @@ def _enrollment_datasets(
     return train_ds, val_ds, train_eval_ds, val_images, val_labels
 
 
+def _ensure_native_keras_format() -> None:
+    """Force native ``.keras`` saving for the current thread.
+
+    Keras 2.15 picks the save format from a thread-local flag.  In a fresh
+    worker thread the first save restores that flag to ``False``, so every
+    later ``model.save("...keras")`` in the same thread silently falls back to
+    legacy HDF5 (which also emits the "saving your model as an HDF5 file"
+    warning).  ``/api/retrain`` runs in a FastAPI threadpool thread, so it hits
+    exactly that case for every checkpoint after the first one.
+    """
+    try:
+        from keras.src.saving import saving_lib
+    except Exception:  # pragma: no cover - future Keras layouts
+        return
+    flag = getattr(saving_lib, "_SAVING_V3_ENABLED", None)
+    if flag is not None:
+        flag.value = True
+
+
 def _enrollment_callbacks(
     models_dir: Path,
     model_path: Path,
@@ -326,6 +345,7 @@ def retrain_from_enrollments(
     validation loss, and an optional low-learning-rate fine-tuning phase.
     """
     _require_tensorflow()
+    _ensure_native_keras_format()
     if not 1 <= epochs <= 200:
         raise ValueError("epochs must be between 1 and 200")
     if fine_tune_epochs < 0:
@@ -402,7 +422,7 @@ def retrain_from_enrollments(
             )
             fine_tune_completed = len(fine_history.history.get("loss", []))
 
-    # Always persist the best checkpoint (lowest validation loss).
+    # Always persist the best checkpoint (highest validation accuracy).
     if model_path.exists():
         model = tf.keras.models.load_model(model_path)
 
@@ -901,6 +921,7 @@ def train_architecture(
 ) -> dict:
     """Train one architecture and persist its model, metrics and plots."""
     _require_tensorflow()
+    _ensure_native_keras_format()
     architecture = normalize_architecture_name(architecture)
     if epochs < 1:
         raise ValueError("epochs must be at least 1")
