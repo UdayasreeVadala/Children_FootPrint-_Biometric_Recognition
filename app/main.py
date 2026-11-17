@@ -352,7 +352,7 @@ async def index(request: Request):
 # API: Enroll
 # ---------------------------------------------------------------------------
 @app.post("/api/enroll")
-async def enroll_child(
+def enroll_child(
     child_name: str = Form(...),
     child_id: str = Form(...),
     files: list[UploadFile] = File(...),
@@ -360,7 +360,9 @@ async def enroll_child(
     """Enroll a child by uploading footprint images.
 
     Images are preprocessed (ROI → CLAHE → Gabor) and the enhanced 224×224
-    PNGs are stored under ``data/enrolled/{child_id}/``.
+    PNGs are stored under ``data/enrolled/{child_id}/``.  ``def`` on purpose:
+    the preprocessing is CPU-bound and belongs in the threadpool, not on the
+    event loop (see ``identify_footprint``).
     """
     if not files:
         raise HTTPException(status_code=400, detail="At least one image file is required")
@@ -376,7 +378,7 @@ async def enroll_child(
     for file in files:
         image = None
         try:
-            contents = await file.read()
+            contents = file.file.read()
             if not contents:
                 raise ValueError("The uploaded file is empty")
             if len(contents) > MAX_UPLOAD_BYTES:
@@ -438,13 +440,20 @@ async def enroll_child(
 # API: Identify
 # ---------------------------------------------------------------------------
 @app.post("/api/identify")
-async def identify_footprint(file: UploadFile = File(...)):
-    """Identify a child from a footprint image."""
+def identify_footprint(file: UploadFile = File(...)):
+    """Identify a child from a footprint image.
+
+    Declared ``def`` so Starlette runs the CPU-heavy preprocessing, prediction
+    and Grad-CAM in its threadpool.  When this ran inside the event loop it
+    blocked the Windows accept loop for tens of seconds and uvicorn's
+    ``IocpProactor.accept`` then failed with ``WinError 64`` — the server kept
+    its port closed and every later request was refused.
+    """
     from app.preprocessing.enhancement import enhance_footprint, focus_on_creases
     from app.preprocessing.roi_detection import process_footprint
 
     try:
-        contents = await file.read()
+        contents = file.file.read()
         if len(contents) > MAX_UPLOAD_BYTES:
             raise ValueError("Image must be 10 MB or smaller")
         image = _read_upload(contents)
@@ -634,10 +643,10 @@ async def rename_enrolled(child_id: str, payload: dict = Body(...)):
 # API: Preprocessing preview
 # ---------------------------------------------------------------------------
 @app.post("/api/preprocess-preview")
-async def preprocess_preview(file: UploadFile = File(...)):
+def preprocess_preview(file: UploadFile = File(...)):
     """Preview the preprocessing pipeline on an uploaded image."""
     try:
-        contents = await file.read()
+        contents = file.file.read()
         if len(contents) > MAX_UPLOAD_BYTES:
             raise ValueError("Image must be 10 MB or smaller")
         image = _read_upload(contents)
@@ -678,7 +687,7 @@ async def preprocess_preview(file: UploadFile = File(...)):
 # API: Dataset information
 # ---------------------------------------------------------------------------
 @app.get("/api/dataset-info")
-async def dataset_info():
+def dataset_info():
     """Summarize the on-disk training dataset without running preprocessing."""
     from app.inference.dataset import discover_dataset, resolve_task, summarize_samples
 
@@ -1044,7 +1053,7 @@ async def training_status():
 # API: Enroll a sample from the training dataset (demo convenience)
 # ---------------------------------------------------------------------------
 @app.post("/api/enroll-sample")
-async def enroll_sample(
+def enroll_sample(
     subject: str = Query(default=""),
     limit: int = Query(default=10, ge=2, le=60),
     sensors: str = Query(default="Paper,Scanner,Camera"),
