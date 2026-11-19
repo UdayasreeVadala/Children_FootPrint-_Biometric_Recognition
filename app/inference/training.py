@@ -34,6 +34,8 @@ except ModuleNotFoundError:  # Allows non-ML routes and tests before install.
 
 from app.inference.architectures import (
     ARCHITECTURE_LABELS,
+    HEAD_LAYER_NAMES,
+    build_classification_head_model,
     build_classification_model,
     find_last_conv_layer,
     normalize_architecture_name,
@@ -523,11 +525,14 @@ def _labels_for(samples: list[PreprocessedSample], task: str, class_names: list[
 
 def _make_augmentation() -> "tf.keras.Sequential":
     _require_tensorflow()
+    # Crease locations carry the identity, so geometric augmentation stays
+    # small: larger rotations/zooms move creases to where another subject's
+    # creases are and turn a helpful regulariser into label noise.
     return tf.keras.Sequential(
         [
-            tf.keras.layers.RandomRotation(0.035, fill_mode="constant", fill_value=0.0),
-            tf.keras.layers.RandomZoom(0.08, fill_mode="constant", fill_value=0.0),
-            tf.keras.layers.RandomTranslation(0.04, 0.04, fill_mode="constant", fill_value=0.0),
+            tf.keras.layers.RandomRotation(0.02, fill_mode="constant", fill_value=0.0),
+            tf.keras.layers.RandomZoom(0.06, fill_mode="constant", fill_value=0.0),
+            tf.keras.layers.RandomTranslation(0.03, 0.03, fill_mode="constant", fill_value=0.0),
         ],
         name="footprint_augmentation",
     )
@@ -536,8 +541,8 @@ def _make_augmentation() -> "tf.keras.Sequential":
 def _augment_batch(images, labels, augmentation):
     images = tf.cast(images, tf.float32)
     images = augmentation(images, training=True)
-    images = tf.image.random_brightness(images, max_delta=18.0)
-    images = tf.image.random_contrast(images, lower=0.85, upper=1.15)
+    images = tf.image.random_brightness(images, max_delta=12.0)
+    images = tf.image.random_contrast(images, lower=0.90, upper=1.10)
     images = tf.clip_by_value(images, 0.0, 255.0)
     return images, labels
 
@@ -581,7 +586,7 @@ def _make_datasets(
         .batch(batch_size)
         .prefetch(tf.data.AUTOTUNE)
     )
-    return train_ds, val_ds, test_ds, test_images, test_labels
+    return train_ds, val_ds, test_ds, train_images, train_labels, val_images, val_labels, test_images, test_labels
 
 
 def _macro_f1(y_true: np.ndarray, y_pred: np.ndarray, class_count: int) -> float:
@@ -684,51 +689,284 @@ def _save_confusion_matrix(
     cv2.imwrite(str(destination), image)
 
 
+def _draw_vertical_text(
+    image: np.ndarray,
+    text: str,
+    origin: tuple[int, int],
+    scale: float,
+    color: tuple[int, int, int],
+    thickness: int = 1,
+) -> None:
+    """Draw text rotated 90 degrees onto ``image`` at ``origin``."""
+    (text_width, text_height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    canvas = np.full((text_height + 10, text_width + 10, 3), 18, dtype=np.uint8)
+    cv2.putText(canvas, text, (5, text_height + 4), cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+    rotated = np.ascontiguousarray(np.rot90(canvas))
+    x, y = origin
+    image[y:y + rotated.shape[0], x:x + rotated.shape[1]] = rotated
+
+
+def _save_normalized_confusion_heatmap(
+    matrix: np.ndarray,
+    class_names: list[str],
+    destination: Path,
+) -> None:
+    """Render a row-normalised confusion matrix as a colour heatmap PNG."""
+    matrix = np.asarray(matrix, dtype=np.float64)
+    if matrix.ndim != 2 or matrix.shape[0] == 0:
+        return
+    class_count = matrix.shape[0]
+    totals = matrix.sum(axis=1, keepdims=True)
+    normalised = np.divide(matrix, totals, out=np.zeros_like(matrix), where=totals > 0)
+    labelled = class_count <= 12
+
+    cell = 64 if labelled else max(3, 1100 // class_count)
+    grid = cell * class_count
+    left = 210 if labelled else 90
+    top = 120
+    bottom = 150 if labelled else 60
+    width = left + grid + 200
+    height = top + grid + bottom
+    image = np.full((height, width, 3), 18, dtype=np.uint8)
+
+    heat = cv2.applyColorMap(
+        np.clip(normalised * 255.0, 0, 255).astype(np.uint8), cv2.COLORMAP_INFERNO
+    )
+    heat = cv2.resize(heat, (grid, grid), interpolation=cv2.INTER_NEAREST)
+    image[top:top + grid, left:left + grid] = heat
+    cv2.rectangle(image, (left, top), (left + grid, top + grid), (90, 90, 110), 2)
+
+    if labelled:
+        for row in range(class_count):
+            for column in range(class_count):
+                share = float(normalised[row, column])
+                text = f"{share * 100:.0f}%"
+                color = (25, 25, 32) if share > 0.55 else (245, 245, 250)
+                (text_width, text_height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+                cv2.putText(
+                    image,
+                    text,
+                    (
+                        left + column * cell + (cell - text_width) // 2,
+                        top + row * cell + (cell + text_height) // 2,
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    color,
+                    2,
+                    cv2.LINE_AA,
+                )
+
+        for index, name in enumerate(class_names[:class_count]):
+            label = str(name)[:14]
+            (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 1)
+            cv2.putText(
+                image,
+                label,
+                (left - 22 - text_width, top + index * cell + (cell + text_height) // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (200, 200, 220),
+                1,
+                cv2.LINE_AA,
+            )
+            cv2.putText(
+                image,
+                label,
+                (left + index * cell + (cell - text_width) // 2, top + grid + 40),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                (200, 200, 220),
+                1,
+                cv2.LINE_AA,
+            )
+
+    cv2.putText(image, "Normalized confusion matrix", (24, 42), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (215, 215, 235), 2, cv2.LINE_AA)
+    cv2.putText(
+        image,
+        "Each row = actual class, cell = share of that class",
+        (24, 76),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.6,
+        (175, 175, 200),
+        1,
+        cv2.LINE_AA,
+    )
+    cv2.putText(image, "Predicted", (left, top - 26), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 212, 170), 2, cv2.LINE_AA)
+    actual_label = "Actual"
+    (label_width, _), _ = cv2.getTextSize(actual_label, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+    _draw_vertical_text(
+        image,
+        actual_label,
+        (18, top + grid // 2 - (label_width + 10) // 2),
+        0.65,
+        (0, 212, 170),
+        2,
+    )
+
+    bar_x = left + grid + 46
+    bar_width = 26
+    gradient = np.linspace(1.0, 0.0, grid, dtype=np.float32) * 255.0
+    bar = cv2.applyColorMap(
+        np.repeat(gradient.astype(np.uint8).reshape(grid, 1), bar_width, axis=1), cv2.COLORMAP_INFERNO
+    )
+    image[top:top + grid, bar_x:bar_x + bar_width] = bar
+    cv2.rectangle(image, (bar_x, top), (bar_x + bar_width, top + grid), (90, 90, 110), 2)
+    for fraction, label in ((1.0, "100%"), (0.5, "50%"), (0.0, "0%")):
+        y = int(round(top + grid * (1 - fraction)))
+        cv2.line(image, (bar_x + bar_width, y), (bar_x + bar_width + 8, y), (90, 90, 110), 2)
+        cv2.putText(
+            image,
+            label,
+            (bar_x + bar_width + 14, y + 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (175, 175, 200),
+            2,
+            cv2.LINE_AA,
+        )
+    cv2.putText(image, "Row share", (bar_x - 10, top - 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (175, 175, 200), 1, cv2.LINE_AA)
+
+    cv2.imwrite(str(destination), image)
+
+
 def _save_history_plot(history: dict, destination: Path) -> None:
     """Draw training/validation accuracy and loss curves with OpenCV."""
     epochs = len(history.get("loss", []))
     if epochs == 0:
         return
-    width, height = 720, 300
+    width, height = 1600, 620
     image = np.full((height, width, 3), 18, dtype=np.uint8)
-    left, right, top, bottom = 48, width - 20, 24, height - 36
-
-    def to_points(values, color, maximum_value):
-        points = []
-        for index, value in enumerate(values):
-            x = int(left + (right - left) * (index / max(1, epochs - 1)))
-            y = int(bottom - (bottom - top) * (float(value) / max(maximum_value, 1e-6)))
-            points.append((x, y))
-        if len(points) > 1:
-            cv2.polylines(image, [np.asarray(points, dtype=np.int32)], False, color, 2, cv2.LINE_AA)
-        for point in points:
-            cv2.circle(image, point, 2, color, -1)
+    top, bottom = 92, height - 96
+    axis_color = (90, 90, 110)
+    label_color = (175, 175, 200)
+    grid_color = (40, 40, 54)
 
     accuracy_values = list(history.get("accuracy", [])) + list(history.get("val_accuracy", []))
     loss_values = list(history.get("loss", [])) + list(history.get("val_loss", []))
-    max_accuracy = max(accuracy_values + [0.01])
-    max_loss = max(loss_values + [0.01])
-    to_points(history.get("accuracy", []), (0, 212, 170), max_accuracy)
-    to_points(history.get("val_accuracy", []), (123, 97, 255), max_accuracy)
-    if max_loss > 0:
-        # Draw loss on the lower half with its own scale.
-        loss_scale_height = (bottom - top) * 0.42
+    max_accuracy = max(1.0, max(accuracy_values + [0.01]))
+    max_loss = max(0.01, max(loss_values + [0.01]))
 
-        def to_loss_points(values, color):
-            points = []
-            for index, value in enumerate(values):
-                x = int(left + (right - left) * (index / max(1, epochs - 1)))
-                y = int(bottom - loss_scale_height * (float(value) / max_loss))
-                points.append((x, y))
+    if epochs <= 8:
+        tick_indices = list(range(epochs))
+    else:
+        tick_indices = sorted({round(index * (epochs - 1) / 7) for index in range(8)})
+
+    panels = (
+        (
+            "Accuracy",
+            (120, 730),
+            max_accuracy,
+            True,
+            (("accuracy", (0, 212, 170), "Train"), ("val_accuracy", (123, 97, 255), "Validation")),
+        ),
+        (
+            "Loss",
+            (880, 1560),
+            max_loss,
+            False,
+            (("loss", (255, 71, 87), "Train"), ("val_loss", (255, 193, 7), "Validation")),
+        ),
+    )
+
+    for title, (left, right), scale_max, is_percent, series in panels:
+        def to_x(index: int) -> int:
+            return int(round(left + (right - left) * (index / max(1, epochs - 1))))
+
+        # Panel frame and title.
+        cv2.rectangle(image, (left, top), (right, bottom), axis_color, 2)
+        cv2.putText(image, title, (left, 48), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (215, 215, 235), 2, cv2.LINE_AA)
+        (title_width, _), _ = cv2.getTextSize(title, cv2.FONT_HERSHEY_SIMPLEX, 1.0, 2)
+        cv2.putText(
+            image,
+            f"{epochs} epochs",
+            (left + title_width + 34, 48),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            label_color,
+            2,
+            cv2.LINE_AA,
+        )
+
+        # Legend in the header line, right aligned with the panel.
+        legend_widths = [cv2.getTextSize(name, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0][0] for _, _, name in series]
+        legend_x = right - sum(width + 50 for width in legend_widths)
+        for (_, color, name), text_width in zip(series, legend_widths):
+            cv2.circle(image, (legend_x + 8, 42), 8, color, -1, cv2.LINE_AA)
+            cv2.putText(
+                image,
+                name,
+                (legend_x + 24, 48),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                label_color,
+                2,
+                cv2.LINE_AA,
+            )
+            legend_x += text_width + 50
+
+        # Y axis: ticks with value labels, plus light gridlines.
+        for step in range(5):
+            fraction = step / 4
+            y = int(round(bottom - (bottom - top) * fraction))
+            cv2.line(image, (left - 10, y), (left, y), axis_color, 2)
+            cv2.line(image, (left, y), (right, y), grid_color, 1)
+            value = scale_max * fraction
+            text = f"{value * 100:.0f}%" if is_percent else f"{value:.2f}"
+            (text_width, text_height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.putText(
+                image,
+                text,
+                (left - 18 - text_width, y + text_height // 2),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                label_color,
+                2,
+                cv2.LINE_AA,
+            )
+
+        # X axis: epoch ticks and axis title.
+        for index in tick_indices:
+            x = to_x(index)
+            cv2.line(image, (x, bottom), (x, bottom + 10), axis_color, 2)
+            text = str(index + 1)
+            (text_width, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
+            cv2.putText(
+                image,
+                text,
+                (x - text_width // 2, bottom + 38),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.65,
+                label_color,
+                2,
+                cv2.LINE_AA,
+            )
+        (text_width, _), _ = cv2.getTextSize("Epoch", cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+        cv2.putText(
+            image,
+            "Epoch",
+            ((left + right) // 2 - text_width // 2, bottom + 74),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            label_color,
+            2,
+            cv2.LINE_AA,
+        )
+
+        # Curves for every series in this panel.
+        for key, color, _ in series:
+            points = [
+                (
+                    to_x(index),
+                    int(round(bottom - (bottom - top) * (float(value) / max(scale_max, 1e-6)))),
+                )
+                for index, value in enumerate(history.get(key, []))
+            ]
             if len(points) > 1:
-                cv2.polylines(image, [np.asarray(points, dtype=np.int32)], False, color, 2, cv2.LINE_AA)
+                cv2.polylines(image, [np.asarray(points, dtype=np.int32)], False, color, 4, cv2.LINE_AA)
+            for point in points:
+                cv2.circle(image, point, 4, color, -1, cv2.LINE_AA)
 
-        to_loss_points(history.get("loss", []), (255, 71, 87))
-        to_loss_points(history.get("val_loss", []), (255, 193, 7))
-
-    cv2.rectangle(image, (left, top), (right, bottom), (60, 60, 80), 1)
-    cv2.putText(image, "Accuracy (teal/purple) - Loss (red/amber)", (left, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 200), 1, cv2.LINE_AA)
-    cv2.putText(image, f"Epochs: {epochs}", (right - 110, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 180, 200), 1, cv2.LINE_AA)
     cv2.imwrite(str(destination), image)
 
 
@@ -760,6 +998,8 @@ def _evaluate(
     destination_dir.mkdir(parents=True, exist_ok=True)
     confusion_matrix_path = destination_dir / f"{prefix}_confusion_matrix.png"
     _save_confusion_matrix(matrix, class_names, confusion_matrix_path)
+    normalized_confusion_path = destination_dir / f"{prefix}_normalized_confusion.png"
+    _save_normalized_confusion_heatmap(matrix, class_names, normalized_confusion_path)
 
     per_class = []
     for index, name in enumerate(class_names):
@@ -787,6 +1027,7 @@ def _evaluate(
         "test_images": int(len(test_labels)),
         "confusion_matrix": matrix.tolist(),
         "confusion_matrix_path": str(confusion_matrix_path),
+        "normalized_confusion_path": str(normalized_confusion_path),
         "per_class": per_class,
         "class_distribution": {
             name: int(np.sum(test_labels == index))
@@ -903,6 +1144,105 @@ def _make_epoch_callback(
     return EpochProgress()
 
 
+def _footprint_backbone(model) -> "tf.keras.Model | None":
+    """Return the pretrained backbone of a transfer model, if it has one."""
+    base = getattr(model, "_footprint_base_model", None)
+    if base is not None:
+        return base
+    try:
+        return model.get_layer("backbone")
+    except ValueError:
+        return None
+
+
+def _freeze_backbone(model) -> bool:
+    """Freeze the pretrained backbone so the random head can learn safely."""
+    base = _footprint_backbone(model)
+    if base is None:
+        return False
+    base.trainable = False
+    return True
+
+
+def _backbone_feature_maps(model, images: np.ndarray, batch_size: int) -> np.ndarray:
+    """Run the frozen backbone once over ``images`` and return its feature maps."""
+    feature_map = getattr(model, "_footprint_feature_map", None)
+    if feature_map is None:
+        feature_map = _footprint_backbone(model)
+    if feature_map is None:
+        raise ValueError("This model has no pretrained backbone to cache.")
+    extractor = tf.keras.Model(model.inputs, feature_map, name="backbone_features")
+    return np.asarray(
+        extractor.predict(np.asarray(images, dtype=np.float32), batch_size=batch_size, verbose=0)
+    )
+
+
+def _copy_head_weights(source: "tf.keras.Model", destination: "tf.keras.Model") -> int:
+    """Copy the stage-1 head weights into the full model by layer name."""
+    copied = 0
+    for name in HEAD_LAYER_NAMES:
+        try:
+            source_layer = source.get_layer(name)
+            destination_layer = destination.get_layer(name)
+        except ValueError:
+            continue
+        weights = source_layer.get_weights()
+        if not weights:
+            continue  # Dropout layers carry no weights.
+        if len(weights) != len(destination_layer.get_weights()):
+            raise RuntimeError(
+                f"Cannot copy '{name}': the head and the full model disagree on its parameters."
+            )
+        destination_layer.set_weights(weights)
+        copied += 1
+    if copied < 4:
+        raise RuntimeError("Head pre-training did not produce the expected layers.")
+    return copied
+
+
+def _train_head_on_cached_features(
+    model,
+    train_images: np.ndarray,
+    train_labels: np.ndarray,
+    val_images: np.ndarray,
+    val_labels: np.ndarray,
+    class_count: int,
+    *,
+    epochs: int,
+    batch_size: int,
+    verbose: int,
+    callbacks: list,
+):
+    """Stage 1 of transfer training: fit the head on frozen backbone features.
+
+    The backbone is run exactly once per split instead of once per step, which
+    turns a 60 s/epoch job into a ~1 s/epoch job and makes a few dozen head
+    epochs affordable on CPU.  The trained weights are copied back into the
+    full model afterwards.
+    """
+    features_train = _backbone_feature_maps(model, train_images, batch_size)
+    features_val = _backbone_feature_maps(model, val_images, batch_size)
+    head = build_classification_head_model(
+        features_train.shape[1:], class_count, dropout=0.30
+    )
+    head.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
+        loss="sparse_categorical_crossentropy",
+        metrics=["accuracy"],
+    )
+    history = head.fit(
+        features_train,
+        train_labels,
+        validation_data=(features_val, val_labels),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=callbacks,
+        class_weight=_class_weights(train_labels, class_count),
+        verbose=verbose,
+    )
+    return head, history
+
+
 def train_architecture(
     architecture: str,
     train_samples: list[PreprocessedSample],
@@ -913,25 +1253,39 @@ def train_architecture(
     models_dir: Path,
     *,
     epochs: int = 20,
+    head_epochs: int = 40,
     fine_tune_epochs: int = 8,
     batch_size: int = 16,
     seed: int = 42,
     verbose: int = 2,
+    resume: bool = False,
+    learning_rate: float | None = None,
     progress: Callable[[dict], None] | None = None,
 ) -> dict:
-    """Train one architecture and persist its model, metrics and plots."""
+    """Train one architecture and persist its model, metrics and plots.
+
+    ``resume=True`` reloads the existing checkpoint for this architecture/task
+    and continues training it.  Checkpoint loading is only supported for the
+    custom CNN: the transfer models are trained through a frozen-backbone head
+    stage and cannot be resumed halfway through it.
+    """
     _require_tensorflow()
     _ensure_native_keras_format()
     architecture = normalize_architecture_name(architecture)
     if epochs < 1:
         raise ValueError("epochs must be at least 1")
+    if head_epochs < 1:
+        raise ValueError("head_epochs must be at least 1")
     if fine_tune_epochs < 0:
         raise ValueError("fine_tune_epochs cannot be negative")
+
+    if resume and architecture in {"mobilenetv2", "efficientnetb0"}:
+        raise ValueError("Resuming is only supported for the custom CNN")
 
     models_dir.mkdir(parents=True, exist_ok=True)
     tf.keras.utils.set_random_seed(seed)
 
-    train_ds, val_ds, test_ds, test_images, test_labels = _make_datasets(
+    train_ds, val_ds, test_ds, train_images, train_labels, val_images, val_labels, test_images, test_labels = _make_datasets(
         train_samples,
         validation_samples,
         test_samples,
@@ -940,9 +1294,18 @@ def train_architecture(
         batch_size,
         seed,
     )
-    train_labels = _labels_for(train_samples, task, class_names)
-    model, initialization = _build_with_weights(architecture, len(class_names))
     model_path = models_dir / f"{architecture}_{task}.keras"
+    resumed = bool(resume and model_path.exists())
+    if resumed:
+        # Keep the pre-resume checkpoint: ModelCheckpoint starts a fresh
+        # "best" comparison in this run, so the first epoch would overwrite it.
+        model_path.with_name(model_path.name + ".prev").write_bytes(model_path.read_bytes())
+        model = tf.keras.models.load_model(str(model_path))
+        initialization = (
+            "scratch-resumed" if architecture == "custom_cnn" else "imagenet-resumed"
+        )
+    else:
+        model, initialization = _build_with_weights(architecture, len(class_names))
 
     # Select checkpoints on validation loss rather than validation accuracy.
     # With a small, imbalanced dataset, accuracy can lock in a degenerate
@@ -972,27 +1335,84 @@ def train_architecture(
         ),
     ]
 
-    started = time.time()
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss="sparse_categorical_crossentropy",
-        metrics=["accuracy"],
-    )
-    head_callbacks = list(callbacks)
-    epoch_callback = _make_epoch_callback(progress, architecture, "head", epochs)
-    if epoch_callback is not None:
-        head_callbacks.append(epoch_callback)
-    history = model.fit(
-        train_ds,
-        validation_data=val_ds,
-        epochs=epochs,
-        callbacks=head_callbacks,
-        class_weight=_class_weights(train_labels, len(class_names)),
-        verbose=verbose,
-    )
-    history_dict = {key: [float(value) for value in values] for key, values in history.history.items()}
+    history_path = models_dir / f"{architecture}_{task}_history.json"
+    previous_history: dict[str, list[float]] = {}
+    if resumed and history_path.exists():
+        try:
+            loaded_history = json.loads(history_path.read_text(encoding="utf-8"))
+            if isinstance(loaded_history, dict):
+                previous_history = {
+                    str(key): [float(value) for value in values]
+                    for key, values in loaded_history.items()
+                    if isinstance(values, list)
+                }
+        except (OSError, json.JSONDecodeError, ValueError):
+            previous_history = {}
 
-    if architecture in {"mobilenetv2", "efficientnetb0"} and fine_tune_epochs > 0:
+    started = time.time()
+    history_dict: dict[str, list[float]] = {}
+    head_epochs_completed = 0
+    transfer = architecture in {"mobilenetv2", "efficientnetb0"}
+    frozen = transfer and _freeze_backbone(model)
+
+    if frozen:
+        # Stage 1: feature extraction.  The ImageNet backbone stays frozen and
+        # its feature maps are cached, so the head gets dozens of epochs for the
+        # price of a couple of end-to-end ones.  Training the whole backbone at
+        # the head learning rate (1e-3) destroys the pretrained filters and
+        # leaves the model at chance on 220 identities.
+        cache_callbacks = [
+            callback for callback in callbacks
+            if not isinstance(callback, tf.keras.callbacks.ModelCheckpoint)
+        ]
+        epoch_callback = _make_epoch_callback(
+            progress, architecture, "head", head_epochs
+        )
+        if epoch_callback is not None:
+            cache_callbacks.append(epoch_callback)
+        head, history = _train_head_on_cached_features(
+            model,
+            train_images,
+            train_labels,
+            val_images,
+            val_labels,
+            len(class_names),
+            epochs=head_epochs,
+            batch_size=batch_size,
+            verbose=verbose,
+            callbacks=cache_callbacks,
+        )
+        _copy_head_weights(head, model)
+        history_dict = {
+            key: [float(value) for value in values] for key, values in history.history.items()
+        }
+        head_epochs_completed = len(history_dict.get("loss", []))
+        model.save(model_path)
+    else:
+        model.compile(
+            optimizer=tf.keras.optimizers.Adam(
+                learning_rate=learning_rate if learning_rate is not None else 1e-3
+            ),
+            loss="sparse_categorical_crossentropy",
+            metrics=["accuracy"],
+        )
+        head_callbacks = list(callbacks)
+        epoch_callback = _make_epoch_callback(progress, architecture, "head", epochs)
+        if epoch_callback is not None:
+            head_callbacks.append(epoch_callback)
+        history = model.fit(
+            train_ds,
+            validation_data=val_ds,
+            epochs=epochs,
+            callbacks=head_callbacks,
+            class_weight=_class_weights(train_labels, len(class_names)),
+            verbose=verbose,
+        )
+        history_dict = {
+            key: [float(value) for value in values] for key, values in history.history.items()
+        }
+
+    if frozen and fine_tune_epochs > 0:
         unfrozen = unfreeze_for_fine_tuning(model, number_of_layers=30)
         if unfrozen:
             model.compile(
@@ -1017,6 +1437,12 @@ def train_architecture(
             for key, values in fine_history.history.items():
                 history_dict.setdefault(key, []).extend(float(value) for value in values)
 
+    if previous_history:
+        merged_history = {key: list(values) for key, values in previous_history.items()}
+        for key, values in history_dict.items():
+            merged_history.setdefault(key, []).extend(values)
+        history_dict = merged_history
+
     # Reload the best checkpoint before evaluating.
     if model_path.exists():
         model = tf.keras.models.load_model(model_path)
@@ -1036,15 +1462,18 @@ def train_architecture(
             "architecture_label": ARCHITECTURE_LABELS.get(architecture, architecture),
             "initialization": initialization,
             "epochs_requested": epochs,
+            "head_epochs_requested": head_epochs,
+            "head_epochs_completed": head_epochs_completed,
+            "frozen_backbone": bool(frozen),
             "fine_tune_epochs_requested": fine_tune_epochs,
             "epochs_completed": len(history_dict.get("loss", [])),
+            "resumed": resumed,
             "training_seconds": round(time.time() - started, 2),
             "model_path": str(model_path),
             "last_conv_layer": find_last_conv_layer(model),
             "parameters": int(model.count_params()),
         }
     )
-    history_path = models_dir / f"{architecture}_{task}_history.json"
     training_plot_path = models_dir / f"{architecture}_{task}_training.png"
     with history_path.open("w", encoding="utf-8") as file:
         json.dump(history_dict, file, indent=2)
@@ -1076,6 +1505,7 @@ def train_dataset_models(
     task: str = "auto",
     architectures: Iterable[str] = DEFAULT_ARCHITECTURES,
     epochs: int = 20,
+    head_epochs: int = 40,
     fine_tune_epochs: int = 8,
     batch_size: int = 16,
     seed: int = 42,
@@ -1083,9 +1513,16 @@ def train_dataset_models(
     max_images: int | None = None,
     include_sensors: Iterable[str] | None = ("Paper", "Scanner", "Camera"),
     verbose: int = 2,
+    resume: bool = False,
+    learning_rate: float | None = None,
     progress: Callable[[dict], None] | None = None,
 ) -> dict:
-    """Preprocess the dataset, train every requested architecture, and register it."""
+    """Preprocess the dataset, train every requested architecture, and register it.
+
+    ``resume=True`` continues every requested architecture from its saved
+    checkpoint (custom CNN only) and keeps the other registered architectures
+    in the comparison instead of replacing the registry with this run alone.
+    """
     _require_tensorflow()
     dataset_root = Path(dataset_root)
     models_dir = Path(models_dir)
@@ -1161,6 +1598,23 @@ def train_dataset_models(
             f"one class for task '{resolved_task}'."
         )
 
+    previous_architectures: dict[str, dict] = {}
+    if resume:
+        previous_registry_path = models_dir / "registry.json"
+        if previous_registry_path.exists():
+            try:
+                with previous_registry_path.open("r", encoding="utf-8") as file:
+                    previous_registry = json.load(file)
+            except (OSError, json.JSONDecodeError):
+                previous_registry = {}
+            if (
+                isinstance(previous_registry, dict)
+                and previous_registry.get("task") == resolved_task
+            ):
+                previous_architectures = dict(
+                    previous_registry.get("architectures") or {}
+                )
+
     train_samples, validation_samples, test_samples = grouped_split(
         manifest, resolved_task, seed=seed
     )
@@ -1206,10 +1660,13 @@ def train_dataset_models(
             class_names,
             models_dir,
             epochs=epochs,
+            head_epochs=head_epochs,
             fine_tune_epochs=fine_tune_epochs,
             batch_size=batch_size,
             seed=seed,
             verbose=verbose,
+            resume=resume,
+            learning_rate=learning_rate,
             progress=architecture_progress,
         )
         metrics_by_architecture[architecture] = metrics
@@ -1223,6 +1680,13 @@ def train_dataset_models(
                 "metrics": metrics,
             }
         )
+
+    if previous_architectures:
+        # A resumed custom-CNN run must not delete the transfer models that are
+        # already registered for this task.
+        merged_architectures = dict(previous_architectures)
+        merged_architectures.update(metrics_by_architecture)
+        metrics_by_architecture = merged_architectures
 
     best_architecture = _choose_best(metrics_by_architecture)
     best_metrics = metrics_by_architecture[best_architecture]

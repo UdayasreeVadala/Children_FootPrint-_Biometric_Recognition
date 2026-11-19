@@ -31,7 +31,11 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train FootprintID models on a dataset")
     parser.add_argument("--dataset", default=str(BASE_DIR / "Training_Data"))
     parser.add_argument("--models-dir", default=str(BASE_DIR / "models"))
-    parser.add_argument("--cache-dir", default=str(BASE_DIR / "data" / "cache" / "dataset_224"))
+    parser.add_argument(
+        "--cache-dir",
+        default=None,
+        help="Preprocessing cache directory (default: data/cache/<dataset-name>_224)",
+    )
     parser.add_argument(
         "--architectures",
         default="mobilenetv2,efficientnetb0,custom_cnn",
@@ -43,8 +47,31 @@ def parse_args() -> argparse.Namespace:
         choices=["auto", "identity", "side", "visit", "sensor"],
     )
     parser.add_argument("--epochs", type=int, default=18)
+    parser.add_argument(
+        "--head-epochs",
+        type=int,
+        default=40,
+        help=(
+            "Head-only epochs for the ImageNet transfer models. The frozen "
+            "backbone features are cached, so these are cheap."
+        ),
+    )
     parser.add_argument("--fine-tune-epochs", type=int, default=6)
     parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Continue from the existing checkpoints instead of starting over "
+            "(custom CNN only). Other registered architectures are preserved."
+        ),
+    )
+    parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=None,
+        help="Override the from-scratch Adam learning rate (default 1e-3).",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--max-images", type=int, default=None)
     parser.add_argument("--include-phone", action="store_true")
@@ -95,13 +122,20 @@ def main() -> int:
                 f"time={metrics.get('training_seconds')}s"
             )
 
+    dataset_path = Path(args.dataset)
+    cache_dir = (
+        Path(args.cache_dir)
+        if args.cache_dir
+        else BASE_DIR / "data" / "cache" / f"{dataset_path.name}_224"
+    )
     result = train_dataset_models(
         dataset_root=args.dataset,
         models_dir=args.models_dir,
-        cache_dir=args.cache_dir,
+        cache_dir=cache_dir,
         task=args.task,
         architectures=[name.strip() for name in args.architectures.split(",") if name.strip()],
         epochs=args.epochs,
+        head_epochs=args.head_epochs,
         fine_tune_epochs=args.fine_tune_epochs,
         batch_size=args.batch_size,
         seed=args.seed,
@@ -109,6 +143,8 @@ def main() -> int:
         max_images=args.max_images,
         include_sensors=sensors,
         verbose=0 if args.quiet else 1,
+        resume=args.resume,
+        learning_rate=args.learning_rate,
         progress=progress,
     )
     print("\nTraining complete")

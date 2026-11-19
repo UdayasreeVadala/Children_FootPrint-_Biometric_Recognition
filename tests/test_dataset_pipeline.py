@@ -61,6 +61,16 @@ class TestDatasetDiscovery(unittest.TestCase):
             self.assertEqual({sample.subject for sample in samples}, {"B003", "B004"})
             self.assertEqual(resolve_task(samples, "auto"), "identity")
 
+    def test_parses_side_from_filename_and_keeps_capture_together(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            write_image(root / "Adult01" / "Scanner" / "Visit 1" / "1-left.png")
+            write_image(root / "Adult01" / "Scanner" / "Visit 1" / "1-right.png")
+            samples = discover_dataset(root)
+
+            self.assertEqual({sample.side for sample in samples}, {"Left", "Right"})
+            self.assertEqual(len({sample.group for sample in samples}), 1)
+
     def test_summary_reports_counts_and_visit_breakdown(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)

@@ -10,7 +10,6 @@
     let identifyFile = null;
     let trainingPollTimer = null;
     let trainingActive = false;
-    let datasetLoaded = false;
     let modelsLoaded = false;
 
     // ── DOM References ─────────────────────────────────────
@@ -45,7 +44,6 @@
     const retrainResults = () => $('#retrain-results');
     const openModelsBtn = () => $('#open-models-btn');
 
-    const datasetSummary = () => $('#dataset-summary');
     const modelComparison = () => $('#model-comparison');
     const trainBtn = () => $('#train-btn');
     const trainEpochs = () => $('#train-epochs');
@@ -169,7 +167,6 @@
         });
 
         if (name === 'models') {
-            refreshDatasetInfo();
             refreshModels();
             resumeTrainingStatus();
         }
@@ -735,69 +732,6 @@
         }
     }
 
-    // ── Dataset Overview ──────────────────────────────────
-
-    async function refreshDatasetInfo(force = false) {
-        if (datasetLoaded && !force) return;
-        const container = datasetSummary();
-        try {
-            const response = await fetch('/api/dataset-info');
-            const data = await response.json();
-            if (!response.ok) throw new Error(data.detail || 'Dataset could not be inspected.');
-            datasetLoaded = true;
-            renderDatasetSummary(data);
-        } catch (error) {
-            container.innerHTML = `<div class="error-message"><span>⚠️</span><span>${escapeHtml(error.message)}</span></div>`;
-        }
-    }
-
-    function renderDatasetSummary(data) {
-        const container = datasetSummary();
-        const stats = [
-            ['Images', data.total_images, 'total usable scans'],
-            ['Subjects', data.subject_count, (data.subjects || []).join(', ') || '—'],
-            ['Sides', (data.sides || []).length, (data.sides || []).join(', ') || '—'],
-            ['Visits', (data.visits || []).length, (data.visits || []).join(', ') || '—'],
-            ['Sensors', (data.sensors || []).length, (data.sensors || []).join(', ') || '—'],
-        ];
-
-        const statHtml = stats
-            .map(
-                ([label, value, detail]) => `
-                <div class="dataset-stat">
-                    <span class="dataset-value">${escapeHtml(value)}</span>
-                    <span class="dataset-label">${escapeHtml(label)}</span>
-                    <span class="dataset-detail">${escapeHtml(detail)}</span>
-                </div>`
-            )
-            .join('');
-
-        const visits = data.by_visit || {};
-        const visitRows = Object.entries(visits)
-            .sort((a, b) => a[0].localeCompare(b[0], undefined, { numeric: true }))
-            .map(([visit, counts]) => {
-                const total = counts.total || 0;
-                const maximum = Math.max(...Object.values(visits).map((entry) => entry.total || 0), 1);
-                return `
-                    <div class="visit-row">
-                        <span class="visit-name">${escapeHtml(visit)}</span>
-                        <div class="visit-track"><div class="visit-fill" style="width:${(total / maximum) * 100}%"></div></div>
-                        <span class="visit-count">${total} · L${counts.left || 0}/R${counts.right || 0}</span>
-                    </div>`;
-            })
-            .join('');
-
-        container.innerHTML = `
-            <div class="dataset-stats">${statHtml}</div>
-            <div class="dataset-meta">
-                <span class="mode-badge neutral">Task: ${escapeHtml(taskLabel(data.task))}</span>
-                <span class="mode-badge ${data.cache_exists ? 'softmax' : 'neutral'}">${data.cache_exists ? 'Preprocessing cache ready' : 'Cache will be built on first training run'}</span>
-                <span class="mode-badge ${data.registry_exists ? 'softmax' : 'neutral'}">${data.registry_exists ? 'Trained registry found' : 'No trained registry yet'}</span>
-            </div>
-            ${visitRows ? `<div class="visit-breakdown">${visitRows}</div>` : ''}
-        `;
-    }
-
     // ── Model Comparison ──────────────────────────────────
 
     async function refreshModels(force = false) {
@@ -813,12 +747,271 @@
         }
     }
 
+    function macroFromPerClass(metrics) {
+        const rows = Array.isArray(metrics.per_class) ? metrics.per_class : [];
+        if (rows.length === 0) {
+            return {
+                precision: Number.isFinite(Number(metrics.test_macro_precision)) ? Number(metrics.test_macro_precision) : null,
+                recall: Number.isFinite(Number(metrics.test_macro_recall)) ? Number(metrics.test_macro_recall) : null,
+            };
+        }
+        const mean = (field) => rows.reduce((sum, row) => sum + (Number(row[field]) || 0), 0) / rows.length;
+        return { precision: mean('precision'), recall: mean('recall') };
+    }
+
+    function classLabelAt(classNames, index) {
+        return Array.isArray(classNames) && classNames[index]
+            ? String(classNames[index])
+            : `Class ${index + 1}`;
+    }
+
+    function wideConfusionMatrixHtml(metrics, classNames) {
+        const matrix = metrics.confusion_matrix;
+        const n = matrix.length;
+        let total = 0;
+        let correct = 0;
+        const entries = [];
+        const errors = [];
+        for (let i = 0; i < n; i += 1) {
+            const row = matrix[i];
+            for (let j = 0; j < n; j += 1) {
+                const value = Number(row[j]) || 0;
+                if (!value) continue;
+                total += value;
+                const entry = { actual: i, predicted: j, count: value };
+                entries.push(entry);
+                if (i === j) {
+                    correct += value;
+                } else {
+                    errors.push(entry);
+                }
+            }
+        }
+
+        errors.sort((a, b) => b.count - a.count);
+        // A 220x220 grid is ~48k cells and locks the tab up, so the numeric
+        // matrix is listed for exactly the non-zero cells (one per test image).
+        const matrixRows = entries.map((entry) => `
+            <tr class="${entry.actual === entry.predicted ? 'diag-row' : ''}">
+                <th scope="row">${escapeHtml(classLabelAt(classNames, entry.actual))}</th>
+                <td>${escapeHtml(classLabelAt(classNames, entry.predicted))}</td>
+                <td>${entry.count}</td>
+            </tr>`).join('');
+        const topErrors = errors.slice(0, 6).map((error) => `
+            <li>
+                <strong>${escapeHtml(classLabelAt(classNames, error.actual))}</strong>
+                → ${escapeHtml(classLabelAt(classNames, error.predicted))}
+                <span>${error.count}</span>
+            </li>`).join('');
+        const errorPct = total ? (100 * (total - correct)) / total : 0;
+
+        return `
+            <div class="confusion-block">
+                <div class="confusion-title">Confusion matrix <span>${n}×${n} · ${total} test images · one row per non-zero cell</span></div>
+                <div class="confusion-legend">
+                    <span class="confusion-legend-sum">${correct}/${total} correct · ${errorPct.toFixed(1)}% error</span>
+                </div>
+                <div class="matrix-placeholder matrix-sparse">
+                    <table class="confusion-table matrix-table">
+                        <thead><tr><th>Actual</th><th>Predicted</th><th>Count</th></tr></thead>
+                        <tbody>${matrixRows}</tbody>
+                    </table>
+                </div>
+                ${topErrors ? `
+                <details class="confusion-errors">
+                    <summary>Most frequent confusions (${errors.length})</summary>
+                    <ul>${topErrors}</ul>
+                </details>` : ''}
+            </div>`;
+    }
+
+    function confusionTableHtml(metrics, classNames) {
+        const matrix = metrics.confusion_matrix;
+        if (!Array.isArray(matrix) || matrix.length === 0) return '';
+        // Wide matrices (e.g. the 220-class adult benchmark) use the same
+        // numeric table instead of the old heat-map graph.
+        if (matrix.length > 12) return wideConfusionMatrixHtml(metrics, classNames);
+        const labels = Array.isArray(classNames) && classNames.length === matrix.length
+            ? classNames
+            : matrix.map((_, index) => `Class ${index}`);
+        const header = labels.map((label) => `<th>${escapeHtml(label)}</th>`).join('');
+        const rows = matrix.map((row, rowIndex) => {
+            const cells = row.map((value) => `<td>${Number(value) || 0}</td>`).join('');
+            return `<tr><th>${escapeHtml(labels[rowIndex])}</th>${cells}</tr>`;
+        }).join('');
+        return `
+            <div class="confusion-block">
+                <div class="confusion-title">Confusion matrix <span>rows = actual · columns = predicted</span></div>
+                <div class="confusion-scroll">
+                    <table class="confusion-table">
+                        <thead><tr><th></th>${header}</tr></thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>
+            </div>`;
+    }
+
+    function perClassTableHtml(metrics) {
+        const rows = Array.isArray(metrics.per_class) ? metrics.per_class : [];
+        const matrix = metrics.confusion_matrix;
+        if (rows.length === 0) return '';
+        // Small class counts already get the numeric confusion matrix above.
+        if (Array.isArray(matrix) && matrix.length > 0 && matrix.length <= 12) return '';
+        const body = rows.map((row) => `
+            <tr>
+                <th>${escapeHtml(row.label || '')}</th>
+                <td>${formatFraction(row.precision)}</td>
+                <td>${formatFraction(row.recall)}</td>
+                <td>${formatFraction(row.f1)}</td>
+                <td>${row.support === undefined || row.support === null ? '—' : Number(row.support)}</td>
+            </tr>`).join('');
+        return `
+            <details class="per-class-block">
+                <summary>Per-class precision / recall / F1 (${rows.length} classes)</summary>
+                <div class="confusion-scroll">
+                    <table class="confusion-table per-class-table">
+                        <thead><tr><th>Class</th><th>Precision</th><th>Recall</th><th>F1</th><th>Support</th></tr></thead>
+                        <tbody>${body}</tbody>
+                    </table>
+                </div>
+            </details>`;
+    }
+
+    function evaluationSummaryHtml(groups) {
+        const rows = [];
+        groups.forEach((group) => {
+            if (!group.rows.length) return;
+            const label = group.subject ? `${group.title} · ${group.subject}` : group.title;
+            rows.push(`<tr class="eval-group-row"><th colspan="8">${escapeHtml(label)}</th></tr>`);
+            group.rows.forEach(([key, metrics]) => {
+                const macro = macroFromPerClass(metrics);
+                const testImages = metrics.test_images === undefined || metrics.test_images === null
+                    ? '—'
+                    : Number(metrics.test_images);
+                rows.push(`
+                    <tr>
+                        <th>${escapeHtml(metrics.architecture_label || titleCase(key))}</th>
+                        <td>${formatFraction(metrics.test_accuracy)}</td>
+                        <td>${formatFraction(macro.precision)}</td>
+                        <td>${formatFraction(macro.recall)}</td>
+                        <td>${formatFraction(metrics.test_macro_f1)}</td>
+                        <td>${formatFraction(metrics.test_top3_accuracy)}</td>
+                        <td>${formatNumber(metrics.parameters)}</td>
+                        <td>${testImages}</td>
+                    </tr>`);
+            });
+        });
+        if (rows.length === 0) return '';
+        return `
+            <div class="eval-summary">
+                <div class="confusion-title">Evaluation metrics <span>held-out test split · precision, recall and F1 are macro averages over classes</span></div>
+                <div class="confusion-scroll">
+                    <table class="confusion-table eval-table">
+                        <thead>
+                            <tr><th>Model</th><th>Accuracy</th><th>Precision</th><th>Recall</th><th>F1</th><th>Top-3</th><th>Parameters</th><th>Test images</th></tr>
+                        </thead>
+                        <tbody>${rows.join('')}</tbody>
+                    </table>
+                </div>
+                <p class="eval-summary-note">Confusion matrix, per-class precision / recall / F1 and training curves are on each model card below.</p>
+            </div>`;
+    }
+
+    function modelCardHtml(key, metrics, index, options = {}) {
+        const benchmark = Boolean(options.benchmark);
+        const activeModel = options.activeModel || null;
+        const bestModel = options.bestModel || null;
+        const classNames = options.classNames || [];
+        const accuracy = metrics.test_accuracy;
+        const accuracyLabel = metrics.accuracy_label || (benchmark ? 'Test top-1' : 'Test accuracy');
+        const selectable = metrics.selectable !== false && !benchmark;
+        const isActive = !benchmark && key === activeModel;
+        const isBest = !benchmark && key === bestModel;
+        const barWidth = accuracy === null || accuracy === undefined ? 0 : Math.min(100, accuracy * 100);
+        const macro = macroFromPerClass(metrics);
+        const initialisation = metrics.initialization === 'imagenet'
+            ? 'ImageNet transfer'
+            : metrics.initialization === 'scratch'
+                ? 'From scratch'
+                : '—';
+        const calibration = (options.calibrationReport || {})[key];
+        const calibrationLine = calibration
+            ? `<div class="model-calibration">
+                   calibrated c=${calibration.center} · FAR ${formatFraction(calibration.false_accept_rate)} · FRR ${formatFraction(calibration.false_reject_rate)}
+               </div>`
+            : '';
+
+        return `
+            <article class="model-card ${isActive ? 'active' : ''}">
+                <div class="model-card-head">
+                    <div>
+                        <div class="model-rank">#${index + 1}</div>
+                        <h4 class="model-name">${escapeHtml(metrics.architecture_label || titleCase(key))}</h4>
+                        <div class="model-subtitle">${escapeHtml(initialisation)} · ${formatNumber(metrics.parameters)} params</div>
+                    </div>
+                    <div class="model-badges">
+                        ${benchmark ? '<span class="model-badge neutral">Adult benchmark</span>' : ''}
+                        ${isActive ? '<span class="model-badge active">Active</span>' : ''}
+                        ${isBest && !isActive ? '<span class="model-badge best">Best</span>' : ''}
+                    </div>
+                </div>
+
+                <div class="model-metric-grid">
+                    <div class="model-metric">
+                        <span class="metric-value">${formatFraction(accuracy)}</span>
+                        <span class="metric-label">${escapeHtml(accuracyLabel)}</span>
+                    </div>
+                    <div class="model-metric">
+                        <span class="metric-value">${formatFraction(macro.precision)}</span>
+                        <span class="metric-label">Precision (macro)</span>
+                    </div>
+                    <div class="model-metric">
+                        <span class="metric-value">${formatFraction(macro.recall)}</span>
+                        <span class="metric-label">Recall (macro)</span>
+                    </div>
+                    <div class="model-metric">
+                        <span class="metric-value">${formatFraction(metrics.test_macro_f1)}</span>
+                        <span class="metric-label">F1 score (macro)</span>
+                    </div>
+                    <div class="model-metric">
+                        <span class="metric-value">${formatFraction(metrics.test_top3_accuracy)}</span>
+                        <span class="metric-label">Top-3</span>
+                    </div>
+                    <div class="model-metric">
+                        <span class="metric-value">${formatNumber(metrics.parameters)}</span>
+                        <span class="metric-label">Parameters</span>
+                    </div>
+                </div>
+
+                <div class="metric-bar">
+                    <div class="metric-bar-fill" style="width:${barWidth}%"></div>
+                </div>
+                ${calibrationLine}
+                ${confusionTableHtml(metrics, classNames)}
+                ${perClassTableHtml(metrics)}
+
+                <div class="model-foot">
+                    <span>${metrics.epochs_completed || 0} epochs · ${metrics.test_images || 0} test images · ${formatSeconds(metrics.training_seconds)} train</span>
+                    ${benchmark
+                        ? `<span class="model-badge neutral" title="Trained on adult footprints; cannot identify children">Display only</span>`
+                        : selectable
+                        ? `<button type="button" class="btn btn-secondary btn-sm select-model-btn ${isActive ? 'is-active' : ''}"
+                                data-architecture="${escapeHtml(key)}" ${isActive ? 'disabled' : ''}>
+                               ${isActive ? 'In use' : 'Use this model'}
+                           </button>`
+                        : `<span class="model-badge neutral" title="Trained on an earlier class set; retrain from enrollments to use it">Benchmark only</span>`}
+                </div>
+                <div class="model-artifacts" data-architecture="${escapeHtml(key)}" data-benchmark="${benchmark ? 'true' : 'false'}"></div>
+            </article>`;
+    }
+
     function renderModelComparison(data) {
         const container = modelComparison();
-        const architectures = data.architectures || {};
-        const entries = Object.entries(architectures);
+        const entries = Object.entries(data.architectures || {});
+        const benchmark = data.benchmark && data.benchmark.available ? data.benchmark : null;
+        const benchmarkEntries = benchmark ? Object.entries(benchmark.architectures || {}) : [];
 
-        if (!data.has_registry || entries.length === 0) {
+        if (entries.length === 0 && benchmarkEntries.length === 0) {
             container.innerHTML = `
                 <div class="empty-state">
                     <p>${escapeHtml(data.message || 'No dataset-trained models yet. Start training above.')}</p>
@@ -828,90 +1021,86 @@
 
         const activeModel = data.active_model || data.best_model;
         const task = data.task;
+        const byAccuracy = (left, right) => (right[1].test_accuracy || 0) - (left[1].test_accuracy || 0);
+        entries.sort(byAccuracy);
+        benchmarkEntries.sort(byAccuracy);
 
-        entries.sort((a, b) => {
-            const left = a[1].test_accuracy || 0;
-            const right = b[1].test_accuracy || 0;
-            return right - left;
-        });
+        const subjectText = benchmark && Number.isFinite(Number(benchmark.subjects))
+            ? `${benchmark.subjects} subjects`
+            : 'adult data';
+        const summaryGroups = [];
+        if (benchmarkEntries.length > 0) {
+            summaryGroups.push({ title: 'Adult benchmark', subject: subjectText, rows: benchmarkEntries });
+        }
+        if (entries.length > 0) {
+            summaryGroups.push({
+                title: 'Children dataset',
+                subject: task ? taskLabel(task) : '',
+                rows: entries,
+            });
+        }
+        const summaryHtml = evaluationSummaryHtml(summaryGroups);
 
-        const cards = entries
-            .map(([key, metrics], index) => {
-                const accuracy = metrics.test_accuracy;
-                const isActive = key === activeModel;
-                const isBest = key === data.best_model;
-                const barWidth = accuracy === null || accuracy === undefined ? 0 : Math.min(100, accuracy * 100);
-                const initialisation = metrics.initialization === 'imagenet'
-                    ? 'ImageNet transfer'
-                    : metrics.initialization === 'scratch'
-                        ? 'From scratch'
-                        : '—';
-                const calibration = (data.calibration_report || {})[key];
-                const calibrationLine = calibration
-                    ? `<div class="model-calibration">
-                           calibrated c=${calibration.center} · FAR ${formatFraction(calibration.false_accept_rate)} · FRR ${formatFraction(calibration.false_reject_rate)}
-                       </div>`
-                    : '';
-                return `
-                    <article class="model-card ${isActive ? 'active' : ''}">
-                        <div class="model-card-head">
-                            <div>
-                                <div class="model-rank">#${index + 1}</div>
-                                <h4 class="model-name">${escapeHtml(metrics.architecture_label || titleCase(key))}</h4>
-                                <div class="model-subtitle">${escapeHtml(initialisation)} · ${formatNumber(metrics.parameters)} params</div>
-                            </div>
-                            <div class="model-badges">
-                                ${isActive ? '<span class="model-badge active">Active</span>' : ''}
-                                ${isBest && !isActive ? '<span class="model-badge best">Best</span>' : ''}
-                            </div>
-                        </div>
+        const sections = [];
 
-                        <div class="model-metric-grid">
-                            <div class="model-metric">
-                                <span class="metric-value">${formatFraction(accuracy)}</span>
-                                <span class="metric-label">Test accuracy</span>
-                            </div>
-                            <div class="model-metric">
-                                <span class="metric-value">${formatFraction(metrics.test_top3_accuracy)}</span>
-                                <span class="metric-label">Top-3</span>
-                            </div>
-                            <div class="model-metric">
-                                <span class="metric-value">${formatFraction(metrics.test_macro_f1)}</span>
-                                <span class="metric-label">Macro F1</span>
-                            </div>
-                            <div class="model-metric">
-                                <span class="metric-value">${formatSeconds(metrics.training_seconds)}</span>
-                                <span class="metric-label">Train time</span>
-                            </div>
-                        </div>
+        if (benchmarkEntries.length > 0) {
+            const cards = benchmarkEntries
+                .map(([key, metrics], index) =>
+                    modelCardHtml(key, metrics, index, { benchmark: true, classNames: benchmark.class_names || [] })
+                )
+                .join('');
+            sections.push(`
+                <div class="comparison-section benchmark-section">
+                    <div class="comparison-heading">
+                        <span>Adult benchmark · ${escapeHtml(subjectText)}</span>
+                        <span class="model-badge neutral">Display only</span>
+                    </div>
+                    <div class="info-message">
+                        <span>ℹ️</span>
+                        <span>These EfficientNet-B0, MobileNetV2 and Custom CNN checkpoints were
+                        trained on the adult footprint dataset and predict adult identities, so
+                        they are shown for architecture comparison only. Child recognition keeps
+                        using the enrolled-child models below.</span>
+                    </div>
+                    <div class="model-cards">${cards}</div>
+                </div>`);
+        }
 
-                        <div class="metric-bar">
-                            <div class="metric-bar-fill" style="width:${barWidth}%"></div>
-                        </div>
-                        ${calibrationLine}
+        if (entries.length > 0) {
+            const cards = entries
+                .map(([key, metrics], index) =>
+                    modelCardHtml(key, metrics, index, {
+                        activeModel,
+                        bestModel: data.best_model,
+                        calibrationReport: data.calibration_report,
+                        classNames: data.class_names || [],
+                    })
+                )
+                .join('');
+            const note = task && task !== 'identity'
+                ? `<div class="info-message">
+                       <span>ℹ️</span>
+                       <span>The dataset contains a single child, so models are trained on the
+                       <strong>${escapeHtml(taskLabel(task))}</strong> task. Their 256-D penultimate
+                       embeddings are used for child verification with cosine similarity.</span>
+                   </div>`
+                : '';
+            sections.push(`
+                <div class="comparison-section">
+                    ${benchmarkEntries.length > 0 ? '<div class="comparison-heading">Child-identification models</div>' : ''}
+                    ${note}
+                    <div class="model-cards">${cards}</div>
+                </div>`);
+        } else {
+            sections.push(`
+                <div class="info-message">
+                    <span>ℹ️</span>
+                    <span>No child-identification models are registered yet. Enroll children and
+                    retrain from enrollments to add one.</span>
+                </div>`);
+        }
 
-                        <div class="model-foot">
-                            <span>${metrics.epochs_completed || 0} epochs · ${metrics.test_images || 0} test images</span>
-                            <button type="button" class="btn btn-secondary btn-sm select-model-btn ${isActive ? 'is-active' : ''}"
-                                    data-architecture="${escapeHtml(key)}" ${isActive ? 'disabled' : ''}>
-                                ${isActive ? 'In use' : 'Use this model'}
-                            </button>
-                        </div>
-                        <div class="model-artifacts" data-architecture="${escapeHtml(key)}"></div>
-                    </article>`;
-            })
-            .join('');
-
-        const note = task && task !== 'identity'
-            ? `<div class="info-message">
-                   <span>ℹ️</span>
-                   <span>The dataset contains a single child, so models are trained on the
-                   <strong>${escapeHtml(taskLabel(task))}</strong> task. Their 256-D penultimate
-                   embeddings are used for child verification with cosine similarity.</span>
-               </div>`
-            : '';
-
-        container.innerHTML = `${note}<div class="model-cards">${cards}</div>`;
+        container.innerHTML = summaryHtml + sections.join('');
         loadModelArtifacts();
     }
 
@@ -920,14 +1109,17 @@
         await Promise.allSettled(
             targets.map(async (target) => {
                 const architecture = target.dataset.architecture;
+                const source = target.dataset.benchmark === 'true' ? '&source=benchmark' : '';
+                // The raw counts are rendered from the numeric registry data above,
+                // so the images loaded here are the curves and the normalised heatmap.
                 const kinds = [
                     ['training', 'Training curves'],
-                    ['confusion', 'Confusion matrix'],
+                    ['normalized_confusion', 'Normalized confusion heatmap'],
                 ];
                 const results = await Promise.allSettled(
                     kinds.map(async ([kind, label]) => {
                         const response = await fetch(
-                            `/api/models/artifact?architecture=${encodeURIComponent(architecture)}&kind=${kind}`
+                            `/api/models/artifact?architecture=${encodeURIComponent(architecture)}&kind=${kind}${source}`
                         );
                         if (!response.ok) throw new Error('unavailable');
                         const data = await response.json();
@@ -940,7 +1132,7 @@
                     const box = document.createElement('div');
                     box.className = 'model-artifact';
                     const img = document.createElement('img');
-                    img.src = `data:image/png;base64,${result.value.image}`;
+                    img.src = `data:${result.value.mime || 'image/png'};base64,${result.value.image}`;
                     img.alt = `${result.value.label} for ${architecture}`;
                     img.loading = 'lazy';
                     const caption = document.createElement('p');
@@ -1079,7 +1271,6 @@
                     Training complete${best ? ` — best model: <strong>${escapeHtml(titleCase(best))}</strong>` : ''}.
                 </span></div>`;
             refreshModels(true);
-            refreshDatasetInfo(true);
             refreshModelInfo();
         } else if (status.stage === 'failed') {
             trainStage().textContent = 'Training failed';
@@ -1255,9 +1446,10 @@
             }
         });
 
+        
+
         refreshEnrolledList();
         refreshModelInfo();
-        refreshDatasetInfo();
         refreshModels();
         resumeTrainingStatus();
     });

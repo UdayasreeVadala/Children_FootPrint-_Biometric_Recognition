@@ -93,10 +93,18 @@ Useful options:
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `--architectures` | `mobilenetv2,efficientnetb0,custom_cnn` | Models to train. |
+| `--dataset` | `Training_Data` | Dataset root to train on. |
+| `--models-dir` | `models` | Where models, metrics and `registry.json` are written. |
+| `--cache-dir` | `data/cache/<dataset>_224` | Preprocessing cache to reuse. |
 | `--task` | `auto` | `auto`, `identity`, `side`, `visit`, or `sensor`. |
-| `--epochs` | `18` | Head-training epochs. |
-| `--fine-tune-epochs` | `6` | Backbone fine-tuning epochs for transfer models. |
+| `--epochs` | `18` | Epochs for the custom CNN (trained from scratch). |
+| `--head-epochs` | `40` | Head-only epochs for the transfer models; their frozen backbone features are cached, so these are cheap. |
+| `--fine-tune-epochs` | `6` | Backbone fine-tuning epochs for transfer models (slow on CPU). |
+| `--resume` | off | Continue the custom CNN from its checkpoint instead of starting over. |
+| `--learning-rate` | `1e-3` | From-scratch Adam learning rate (use a smaller value when resuming). |
 | `--batch-size` | `16` | Training batch size. |
+| `--seed` | `42` | Random seed for the split, shuffling and initialisation. |
+| `--quiet` | off | Suppress per-epoch progress output. |
 | `--include-phone` | off | Include the noisy phone photographs. |
 | `--max-images` | all | Cap the number of images for quick experiments. |
 | `--force-preprocess` | off | Rebuild the preprocessing cache. |
@@ -121,6 +129,139 @@ models/
 
 The preprocessing cache lives in `data/cache/dataset_224/` and is reused on
 later runs unless `--force-preprocess` is supplied.
+
+---
+
+## Adult benchmark and children prototype
+
+The public adult dataset is the primary experiment; the children's captures are
+a small cross-domain prototype.  They are deliberately kept in separate folders
+so a benchmark run can never overwrite the child models.
+
+### Adult dataset
+
+The benchmark uses the 220-subject MATLAB footprint dataset: six acquisition
+visits per subject, 1,320 foot images, exported as
+
+```text
+data/external/adult_mat_footprints/
+└── Adult001/Scanner/Visit 1/001_1.png   …  Adult220/Scanner/Visit 6/220_6.png
+```
+
+Convert the raw `.mat` files (named `001_1.mat` … `220_6.mat`) once:
+
+```powershell
+python import_mat_adult_dataset.py --source data/external/adult_mat_raw
+```
+
+### Training the benchmark
+
+```powershell
+python train.py `
+  --dataset data/external/adult_mat_footprints `
+  --models-dir models/adult_220_benchmark `
+  --cache-dir data/cache/adult_mat_footprints_224 `
+  --architectures mobilenetv2,efficientnetb0,custom_cnn `
+  --epochs 25 --head-epochs 60 --fine-tune-epochs 0 --batch-size 16
+```
+
+Visits 1–4 train, visit 5 validates, visit 6 is the held-out test set (one image
+per identity).  Models, curves, confusion matrices and `registry.json` are
+written to `models/adult_220_benchmark`.
+
+| Architecture | Initialisation | Test top-1 | Test top-3 |
+| --- | --- | --- | --- |
+| EfficientNet-B0 | ImageNet, frozen | 93.6% | 94.5% |
+| MobileNetV2 | ImageNet, frozen | 93.2% | 94.6% |
+| Custom CNN | from scratch (resumed) | 77.3% | 86.8% |
+
+Run `python build_report.py` to regenerate `results/REPORT.md` and the figures.
+
+### Resuming the custom CNN
+
+The transfer models are cheap to redo — their head trains on cached backbone
+features in about a minute. The custom CNN does not: a full run is hours on CPU.
+`--resume` continues it from the saved checkpoint instead of restarting:
+
+```powershell
+python train.py `
+  --dataset data/external/adult_mat_footprints `
+  --models-dir models/adult_220_benchmark `
+  --cache-dir data/cache/adult_mat_footprints_224 `
+  --architectures custom_cnn --epochs 40 --resume --learning-rate 5e-4 `
+  --batch-size 16 --fine-tune-epochs 0
+```
+
+What `--resume` does:
+
+- reloads `custom_cnn_identity.keras` and first copies it to
+  `custom_cnn_identity.keras.prev`, because checkpoint selection restarts in the
+  new process and the first epoch would otherwise overwrite the previous best;
+- appends the new epochs to the existing `custom_cnn_identity_history.json`, so
+  the training curve covers both stages;
+- merges the registry instead of replacing it, so the MobileNetV2 and
+  EfficientNet-B0 rows survive a custom-CNN-only resume.
+
+Only the custom CNN can be resumed. A transfer model is trained through a frozen
+backbone head stage that cannot be continued halfway.
+
+On the 220-identity benchmark a second stage at `--learning-rate 5e-4` raised
+visit-5 validation accuracy from **0.5545** after 25 epochs to **0.7545** after
+65 cumulative epochs, and held-out visit-6 test top-1 from **59.1% to 77.3%**
+(top-3 **76.8% → 86.8%**, macro F1 **0.519 → 0.725**). The resume trained all 40
+additional epochs; the final numbers are in the registry, the metrics file and
+`results/REPORT.md`.
+
+### Two fixes that made this work
+
+- **Spatial head instead of global average pooling.**  A footprint is identified
+  by *where* its creases and arch sit.  GAP averaged that away and kept every
+  model at chance (~0.5% for 220 classes) even though a nearest-neighbour check
+  on the same images reached 90%.  The heads now keep a 7×7 grid: a 1×1
+  projection to 64 channels and flatten for the transfer models, a 7×7 average
+  pool for the custom CNN.
+- **Freeze the pretrained backbone while the head learns.**  The dataset trainer
+  used to fine-tune the whole ImageNet backbone at the head learning rate
+  (`Adam(1e-3)`), which destroyed the pretrained filters in a few steps.  The
+  transfer models now cache the frozen backbone's feature maps, train the head
+  for dozens of epochs in seconds, and only then optionally unfreeze the last 30
+  layers at `1e-5`.
+
+### Children's data prototype
+
+Do not score children against the adult softmax class labels: an adult identity
+classifier can only emit adult IDs, so that accuracy is 0% by construction.  The
+prototype instead reuses the adult network's 256-D embedding as a fixed feature
+extractor and matches each held-out child image against a gallery built from
+that child's other images:
+
+```powershell
+python evaluate_case_study.py --models-dir models/adult_220_benchmark
+```
+
+With EfficientNet-B0 as the adult feature extractor and 34 children (248 images,
+random chance 2.9%), a leave-one-identity-out open-set probe on PCA-whitened
+features (128 dimensions) measures **61.1% top-1**, genuine/impostor ROC-AUC
+0.60, and an equal error rate of 0.30 on the margin score.  On the deployed
+pipeline the operating point requires both an absolute whitened cosine
+similarity of at least **0.50** and a lead over the runner-up of at least
+**0.12**; on held-out probes this rejects ~11% of adult (out-of-domain) feet
+while still accepting the enrolled gallery.  These are feasibility numbers on a
+very small, heterogeneous set — not a production accuracy claim.
+
+> Earlier revisions of this document reported 40.5% top-1 / 73.5% rejected.
+> That protocol included the query image in its own gallery centroid and used a
+> non-discriminative ReLU embedding, so those figures were optimistic and are
+> superseded by the leave-one-identity-out numbers above.
+
+### Non-footprint rejection
+
+Before any embedding comparison, `process_footprint` computes a deterministic
+quality report (foreground area, contrast, aspect ratio, solidity, outline and
+border contact).  Blank pages, solid colours, noise, gradients and solid
+geometric blobs fail this gate and the API returns **Unknown Child** without
+calling the classifier.  Calibration on 40 raw adult footprints gives 100%
+acceptance, while synthetic non-foot images are all rejected.
 
 ---
 
@@ -193,19 +334,25 @@ and displayed in the enrollment and identification results.
 | --- | --- | --- |
 | MobileNetV2 | ImageNet (fallback: scratch) | Lightweight transfer model with rescaling to `[-1, 1]`. |
 | EfficientNet-B0 | ImageNet (fallback: scratch) | Stronger transfer model; slower on CPU. |
-| Custom CNN | Scratch | Compact four-block CNN with batch normalisation, ~1M parameters. |
+| Custom CNN | Scratch | Four-block CNN with batch normalisation, ~3M parameters. |
 
 Every model exposes:
 
 - a named `embedding` layer (256-D) for verification;
-- a final convolutional layer for Grad-CAM;
+- a final convolutional layer for Grad-CAM (`spatial_head_projection` for the
+  transfer models, `custom_last_conv` for the custom CNN);
 - a raw 0–255 RGB input contract, with architecture-specific scaling inside the
-  model.
+  model;
+- a spatial classification head (a 7×7 grid flattened into the dense layers)
+  rather than global average pooling, because crease *location* carries the
+  identity.
 
 Training uses grouped splits by capture group (subject + visit + sensor + side)
 so near-duplicate images cannot leak between train, validation, and test. It
 also applies light rotation/zoom/translation/brightness/contrast augmentation and
-class weights. The registry chooses the best model by test accuracy, then top-3
+class weights.  Transfer models cache their frozen backbone features for the
+head stage, so dozens of head epochs cost seconds; the custom CNN trains from
+scratch.  The registry chooses the best model by test accuracy, then top-3
 accuracy, then macro F1 — but any architecture can be activated from the Model
 Lab.
 

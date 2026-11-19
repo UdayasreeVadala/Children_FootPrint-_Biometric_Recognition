@@ -186,12 +186,18 @@ def discover_dataset(
 
         subject = parts[0]
         visit = _guess_visit(parts[:-1])
-        side = _guess_side(parts[:-1])
+        # Include the filename: imported datasets commonly encode L/R in the
+        # filename rather than in a directory (for example ``scan-left.png``).
+        side = _guess_side([*parts[:-1], path.stem])
         sensor = _guess_sensor(parts[:-1])
         if allowed_sensors is not None and sensor.lower() not in allowed_sensors:
             continue
+        # A capture group identifies one acquisition session, not a class
+        # label.  Keeping both halves of a split adult scan in this one group
+        # prevents a left/right pair from the same scan being split between
+        # training and evaluation.
         group = "|".join(
-            [_clean_segment(subject), _clean_segment(visit), _clean_segment(sensor), _clean_segment(side)]
+            [_clean_segment(subject), _clean_segment(visit), _clean_segment(sensor)]
         )
         samples.append(
             DatasetSample(

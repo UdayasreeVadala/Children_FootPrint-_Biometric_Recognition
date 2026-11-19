@@ -11,6 +11,25 @@
     <link rel="stylesheet" href="/static/css/style.css">
 </head>
 <body>
+    <!-- ==================== BACKGROUND WALKING TRAIL ==================== -->
+<div class="footprint-trail-bg" aria-hidden="true">
+    <!-- Starting at Bottom-Right -->
+    <span class="trail-step right" style="bottom: 6%;  right: 2%;   --rot: -34deg; animation-delay: 0s;"></span>
+    <span class="trail-step left"  style="bottom: 11%; right: 6%;   --rot: -36deg; animation-delay: 0.7s;"></span>
+    <span class="trail-step right" style="bottom: 20%; right: 6%;   --rot: -32deg; animation-delay: 1.4s;"></span>
+    <span class="trail-step left"  style="bottom: 25%; right: 10%;  --rot: -35deg; animation-delay: 2.1s;"></span>
+    <span class="trail-step right" style="bottom: 34%; right: 10%;  --rot: -33deg; animation-delay: 2.8s;"></span>
+    <span class="trail-step left"  style="bottom: 39%; right: 14%;  --rot: -36deg; animation-delay: 3.5s;"></span>
+
+    <!-- Continuing from Center-Left up toward Top-Left -->
+    <span class="trail-step right" style="top: 44%; left: 14%; --rot: -35deg; animation-delay: 4.2s;"></span>
+    <span class="trail-step left"  style="top: 39%; left: 10%; --rot: -38deg; animation-delay: 4.9s;"></span>
+    <span class="trail-step right" style="top: 30%; left: 10%; --rot: -33deg; animation-delay: 5.6s;"></span>
+    <span class="trail-step left"  style="top: 25%; left: 6%;  --rot: -36deg; animation-delay: 6.3s;"></span>
+    <span class="trail-step right" style="top: 16%; left: 5%;  --rot: -34deg; animation-delay: 7.0s;"></span>
+    <span class="trail-step left"  style="top: 11%; left: 1.5%; --rot: -37deg; animation-delay: 7.7s;"></span>
+</div>
+
     <!-- ==================== HEADER ==================== -->
     <header id="app-header">
         <div class="header-content">
@@ -27,234 +46,236 @@
 
     <!-- ==================== MAIN CONTAINER ==================== -->
     <main id="app-main" class="container">
-        <div class="app-layout">
 
-            <!-- ========== PRIMARY CONTENT ========== -->
-            <div class="primary-content">
+        <!-- ========== PRIMARY CONTENT ========== -->
+        <div class="primary-content">
 
-                <!-- Tab Navigation -->
-                <nav id="tab-nav" class="tab-nav" role="tablist">
-                    <button class="tab-btn active" data-tab="enroll" role="tab" aria-selected="true" aria-controls="enroll-panel" id="tab-enroll">
-                        <span class="tab-icon">➕</span>
-                        <span class="tab-label">Enroll Child</span>
-                    </button>
-                    <button class="tab-btn" data-tab="identify" role="tab" aria-selected="false" aria-controls="identify-panel" id="tab-identify">
-                        <span class="tab-icon">🔍</span>
-                        <span class="tab-label">Identify</span>
-                    </button>
-                    <button class="tab-btn" data-tab="models" role="tab" aria-selected="false" aria-controls="models-panel" id="tab-models">
-                        <span class="tab-icon">🧠</span>
-                        <span class="tab-label">Models</span>
-                    </button>
-                </nav>
+            <!-- Tab Navigation -->
+            <nav id="tab-nav" class="tab-nav" role="tablist">
+                <button class="tab-btn active" data-tab="enroll" role="tab" aria-selected="true" aria-controls="enroll-panel" id="tab-enroll">
+                    <span class="tab-icon">➕</span>
+                    <span class="tab-label">Enroll Child</span>
+                </button>
+                <button class="tab-btn" data-tab="identify" role="tab" aria-selected="false" aria-controls="identify-panel" id="tab-identify">
+                    <span class="tab-icon">🔍</span>
+                    <span class="tab-label">Identify</span>
+                </button>
+                <button class="tab-btn" data-tab="models" role="tab" aria-selected="false" aria-controls="models-panel" id="tab-models">
+                    <span class="tab-icon">🧠</span>
+                    <span class="tab-label">Models</span>
+                </button>
+            </nav>
 
-                <!-- ===== ENROLL TAB PANEL ===== -->
-                <section id="enroll-panel" class="tab-panel active" role="tabpanel" aria-labelledby="tab-enroll">
-                    <div class="panel-card">
-                        <h2 class="panel-title">Enroll a New Child</h2>
-                        <p class="panel-desc">Register a child by providing their details and footprint images.</p>
+            <!-- ===== ENROLL TAB PANEL ===== -->
+            <section id="enroll-panel" class="tab-panel active" role="tabpanel" aria-labelledby="tab-enroll">
+                <div class="panel-card">
+                    <h2 class="panel-title">Enroll a New Child</h2>
+                    <p class="panel-desc">Register a child by providing their details and footprint images.</p>
 
-                        <form id="enroll-form" autocomplete="off">
-                            <!-- Child Name -->
-                            <div class="form-group">
-                                <label for="child-name" class="form-label">Child Name</label>
-                                <input type="text" id="child-name" class="form-input" placeholder="Enter child's full name" required>
-                            </div>
-
-                            <!-- Child ID -->
-                            <div class="form-group">
-                                <label for="child-id" class="form-label">Child ID</label>
-                                <input type="text" id="child-id" class="form-input" placeholder="e.g. CHILD_001" required>
-                            </div>
-
-                            <!-- Drag & Drop Upload Zone -->
-                            <div class="form-group">
-                                <label class="form-label">Footprint Images</label>
-                                <div id="enroll-dropzone" class="dropzone" role="button" tabindex="0" aria-label="Upload footprint images">
-                                    <div class="dropzone-content">
-                                        <span class="dropzone-icon">📁</span>
-                                        <p class="dropzone-text">Drag &amp; drop footprint images here</p>
-                                        <p class="dropzone-subtext">or click to browse</p>
-                                        <p class="dropzone-hint">Supports PNG, JPG, BMP — multiple files allowed</p>
-                                    </div>
-                                    <input type="file" id="enroll-file-input" class="file-input-hidden" multiple accept="image/*">
-                                </div>
-                            </div>
-
-                            <!-- Image Preview Grid -->
-                            <div id="enroll-previews" class="preview-grid"></div>
-
-                            <!-- Enroll Button -->
-                            <button type="button" id="enroll-btn" class="btn btn-primary btn-block" disabled>
-                                <span class="btn-text">Enroll Child</span>
-                                <span class="btn-icon">→</span>
-                            </button>
-                        </form>
-
-                        <!-- Processing Indicator -->
-                        <div id="enroll-loading" class="loading-container" hidden>
-                            <div class="spinner"></div>
-                            <p class="loading-text">Processing footprint images…</p>
+                    <form id="enroll-form" autocomplete="off">
+                        <!-- Child Name -->
+                        <div class="form-group">
+                            <label for="child-name" class="form-label">Child Name</label>
+                            <input type="text" id="child-name" class="form-input" placeholder="Enter child's full name" required>
                         </div>
 
-                        <!-- Enroll Results -->
-                        <div id="enroll-results" class="results-area" hidden>
-                            <!-- Populated dynamically by JS -->
+                        <!-- Child ID -->
+                        <div class="form-group">
+                            <label for="child-id" class="form-label">Child ID</label>
+                            <input type="text" id="child-id" class="form-input" placeholder="e.g. CHILD_001" required>
                         </div>
-                    </div>
-                </section>
-
-                <!-- ===== IDENTIFY TAB PANEL ===== -->
-                <section id="identify-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-identify" hidden>
-                    <div class="panel-card">
-                        <h2 class="panel-title">Identify a Child</h2>
-                        <p class="panel-desc">Upload a single footprint image to identify the child.</p>
 
                         <!-- Drag & Drop Upload Zone -->
                         <div class="form-group">
-                            <div id="identify-dropzone" class="dropzone" role="button" tabindex="0" aria-label="Upload footprint image for identification">
+                            <label class="form-label">Footprint Images</label>
+                            <div id="enroll-dropzone" class="dropzone" role="button" tabindex="0" aria-label="Upload footprint images">
                                 <div class="dropzone-content">
-                                    <span class="dropzone-icon">🔎</span>
-                                    <p class="dropzone-text">Drag &amp; drop a footprint image here</p>
+                                    <div class="scanner-preview-wrap">
+                                        <img src="/static/images/footpeint-removebg-preview.png" alt="Infant Footprint" class="scanner-footprint-img" />
+                                        <div class="scan-beam"></div>
+                                        <span class="roi-tag ball">Ball of Foot</span>
+                                        <span class="roi-tag arch">Medial Arch</span>
+                                        <span class="roi-tag crease">Crease Patterns</span>
+                                    </div>
+                                    <p class="dropzone-text">Drag & drop footprint images here</p>
                                     <p class="dropzone-subtext">or click to browse</p>
-                                    <p class="dropzone-hint">Single image — PNG, JPG, or BMP</p>
+                                    <p class="dropzone-hint">Supports PNG, JPG, BMP — multiple files allowed</p>
                                 </div>
-                                <input type="file" id="identify-file-input" class="file-input-hidden" accept="image/*">
+                                <input type="file" id="enroll-file-input" class="file-input-hidden" multiple accept="image/*">
                             </div>
                         </div>
 
-                        <!-- Image Preview -->
-                        <div id="identify-previews" class="preview-grid"></div>
+                        <!-- Image Preview Grid -->
+                        <div id="enroll-previews" class="preview-grid"></div>
 
-                        <!-- Identify Button -->
-                        <button type="button" id="identify-btn" class="btn btn-primary btn-block" disabled>
-                            <span class="btn-text">Identify Child</span>
+                        <!-- Enroll Button -->
+                        <button type="button" id="enroll-btn" class="btn btn-primary btn-block" disabled>
+                            <span class="btn-text">Enroll Child</span>
                             <span class="btn-icon">→</span>
                         </button>
+                    </form>
 
-                        <!-- Processing Indicator -->
-                        <div id="identify-loading" class="loading-container" hidden>
-                            <div class="spinner"></div>
-                            <p class="loading-text">Analyzing footprint pattern…</p>
-                        </div>
+                    <!-- Processing Indicator -->
+                    <div id="enroll-loading" class="loading-container" hidden>
+                        <div class="spinner"></div>
+                        <p class="loading-text">Processing footprint images…</p>
+                    </div>
 
-                        <!-- Identify Results -->
-                        <div id="identify-results" class="results-area" hidden>
-                            <!-- Populated dynamically by JS -->
+                    <!-- Enroll Results -->
+                    <div id="enroll-results" class="results-area" hidden>
+                        <!-- Populated dynamically by JS -->
+                    </div>
+                </div>
+            </section>
+
+            <!-- ===== IDENTIFY TAB PANEL ===== -->
+            <section id="identify-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-identify" hidden>
+                <div class="panel-card">
+                    <h2 class="panel-title">Identify a Child</h2>
+                    <p class="panel-desc">Upload a single footprint image to identify the child.</p>
+
+                    <!-- Drag & Drop Upload Zone -->
+                    <div class="form-group">
+                        <div id="identify-dropzone" class="dropzone" role="button" tabindex="0" aria-label="Upload footprint image for identification">
+                            <div class="dropzone-content">
+                                <div class="scanner-preview-wrap">
+                                    <img src="/static/images/footpeint-removebg-preview.png" alt="Infant Footprint" class="scanner-footprint-img" />
+                                    <div class="scan-beam"></div>
+                                    <span class="roi-tag ball">Ball of Foot</span>
+                                    <span class="roi-tag arch">Medial Arch</span>
+                                    <span class="roi-tag crease">Crease Patterns</span>
+                                </div>
+                                <p class="dropzone-text">Drag & drop a footprint image here</p>
+                                <p class="dropzone-subtext">or click to browse</p>
+                                <p class="dropzone-hint">Single image — PNG, JPG, or BMP</p>
+                            </div>
+                            <input type="file" id="identify-file-input" class="file-input-hidden" accept="image/*">
                         </div>
                     </div>
-                </section>
 
-                <!-- ===== MODELS TAB PANEL ===== -->
-                <section id="models-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-models" hidden>
-                    <div class="panel-card">
-                        <h2 class="panel-title">Model Lab</h2>
-                        <p class="panel-desc">
-                            Inspect the bundled dataset, train and compare all three architectures, and
-                            choose which model powers recognition.
-                        </p>
+                    <!-- Image Preview -->
+                    <div id="identify-previews" class="preview-grid"></div>
 
-                        <!-- Dataset summary -->
-                        <div class="result-card">
-                            <div class="result-card-title">Training Dataset</div>
-                            <div id="dataset-summary" class="dataset-summary-grid">
-                                <p class="empty-state">Loading dataset information…</p>
+                    <!-- Identify Button -->
+                    <button type="button" id="identify-btn" class="btn btn-primary btn-block" disabled>
+                        <span class="btn-text">Identify Child</span>
+                        <span class="btn-icon">→</span>
+                    </button>
+
+                    <!-- Processing Indicator -->
+                    <div id="identify-loading" class="loading-container" hidden>
+                        <div class="spinner"></div>
+                        <p class="loading-text">Analyzing footprint pattern…</p>
+                    </div>
+
+                    <!-- Identify Results -->
+                    <div id="identify-results" class="results-area" hidden>
+                        <!-- Populated dynamically by JS -->
+                    </div>
+                </div>
+            </section>
+
+            <!-- ===== MODELS TAB PANEL ===== -->
+            <section id="models-panel" class="tab-panel" role="tabpanel" aria-labelledby="tab-models" hidden>
+                <div class="panel-card">
+                    <h2 class="panel-title">Model Lab</h2>
+                    <p class="panel-desc">
+                        Inspect the bundled dataset, train and compare all three architectures, and
+                        choose which model powers recognition.
+                    </p>
+
+                    <!-- Training controls -->
+                    <div class="result-card">
+                        <div class="result-card-title">Train Architectures</div>
+                        <div class="form-group">
+                            <span class="form-label">Architectures</span>
+                            <div class="checkbox-grid" id="architecture-checkboxes">
+                                <label class="check-pill">
+                                    <input type="checkbox" id="arch-mobilenetv2" value="mobilenetv2" checked>
+                                    <span>MobileNetV2</span>
+                                </label>
+                                <label class="check-pill">
+                                    <input type="checkbox" id="arch-efficientnetb0" value="efficientnetb0" checked>
+                                    <span>EfficientNet-B0</span>
+                                </label>
+                                <label class="check-pill">
+                                    <input type="checkbox" id="arch-custom_cnn" value="custom_cnn" checked>
+                                    <span>Custom CNN</span>
+                                </label>
                             </div>
                         </div>
 
-                        <!-- Training controls -->
-                        <div class="result-card">
-                            <div class="result-card-title">Train Architectures</div>
+                        <div class="form-row three-up">
                             <div class="form-group">
-                                <span class="form-label">Architectures</span>
-                                <div class="checkbox-grid" id="architecture-checkboxes">
-                                    <label class="check-pill">
-                                        <input type="checkbox" id="arch-mobilenetv2" value="mobilenetv2" checked>
-                                        <span>MobileNetV2</span>
-                                    </label>
-                                    <label class="check-pill">
-                                        <input type="checkbox" id="arch-efficientnetb0" value="efficientnetb0" checked>
-                                        <span>EfficientNet-B0</span>
-                                    </label>
-                                    <label class="check-pill">
-                                        <input type="checkbox" id="arch-custom_cnn" value="custom_cnn" checked>
-                                        <span>Custom CNN</span>
-                                    </label>
-                                </div>
+                                <label for="train-epochs" class="form-label">Epochs</label>
+                                <input type="number" id="train-epochs" class="form-input" min="1" max="100" value="18">
                             </div>
-
-                            <div class="form-row three-up">
-                                <div class="form-group">
-                                    <label for="train-epochs" class="form-label">Epochs</label>
-                                    <input type="number" id="train-epochs" class="form-input" min="1" max="100" value="18">
-                                </div>
-                                <div class="form-group">
-                                    <label for="train-fine-epochs" class="form-label">Fine-tune epochs</label>
-                                    <input type="number" id="train-fine-epochs" class="form-input" min="0" max="50" value="6">
-                                </div>
-                                <div class="form-group">
-                                    <label for="train-batch-size" class="form-label">Batch size</label>
-                                    <input type="number" id="train-batch-size" class="form-input" min="1" max="64" value="16">
-                                </div>
+                            <div class="form-group">
+                                <label for="train-fine-epochs" class="form-label">Fine-tune epochs</label>
+                                <input type="number" id="train-fine-epochs" class="form-input" min="0" max="50" value="6">
                             </div>
-
-                            <label class="check-pill standalone">
-                                <input type="checkbox" id="train-include-phone">
-                                <span>Include phone photos (noisier ROI)</span>
-                            </label>
-
-                            <button type="button" id="train-btn" class="btn btn-primary btn-block">
-                                <span class="btn-text">Train Selected Models</span>
-                                <span class="btn-icon">⚡</span>
-                            </button>
-
-                            <div id="train-progress" class="training-progress" hidden>
-                                <div class="progress-header">
-                                    <span id="train-stage">Starting…</span>
-                                    <span id="train-percent">0%</span>
-                                </div>
-                                <div class="progress-track">
-                                    <div id="train-progress-fill" class="progress-fill"></div>
-                                </div>
-                                <p id="train-detail" class="progress-detail"></p>
-                            </div>
-                            <div id="train-results" class="training-results" aria-live="polite"></div>
-                        </div>
-
-                        <!-- Model comparison -->
-                        <div class="result-card">
-                            <div class="result-card-title">Architecture Comparison</div>
-                            <div id="model-comparison" class="model-comparison-grid">
-                                <p class="empty-state">No dataset-trained models yet. Start training above.</p>
+                            <div class="form-group">
+                                <label for="train-batch-size" class="form-label">Batch size</label>
+                                <input type="number" id="train-batch-size" class="form-input" min="1" max="64" value="16">
                             </div>
                         </div>
 
-                        <!-- Dataset sample enrollment -->
-                        <div class="result-card">
-                            <div class="result-card-title">Quick Demo Enrollment</div>
-                            <p class="result-card-desc">
-                                Enroll a subject straight from the training dataset to exercise the
-                                enrollment → verification → Grad-CAM workflow in one click.
-                            </p>
-                            <div class="form-row">
-                                <div class="form-group">
-                                    <label for="sample-subject" class="form-label">Subject</label>
-                                    <input type="text" id="sample-subject" class="form-input" placeholder="Auto (first subject)">
-                                </div>
-                                <div class="form-group">
-                                    <label for="sample-limit" class="form-label">Images</label>
-                                    <input type="number" id="sample-limit" class="form-input" min="2" max="60" value="12">
-                                </div>
+                        <label class="check-pill standalone">
+                            <input type="checkbox" id="train-include-phone">
+                            <span>Include phone photos (noisier ROI)</span>
+                        </label>
+
+                        <button type="button" id="train-btn" class="btn btn-primary btn-block">
+                            <span class="btn-text">Train Selected Models</span>
+                            <span class="btn-icon">⚡</span>
+                        </button>
+
+                        <div id="train-progress" class="training-progress" hidden>
+                            <div class="progress-header">
+                                <span id="train-stage">Starting…</span>
+                                <span id="train-percent">0%</span>
                             </div>
-                            <button type="button" id="enroll-sample-btn" class="btn btn-secondary btn-block">
-                                <span class="btn-text">Enroll Dataset Sample</span>
-                                <span class="btn-icon">📥</span>
-                            </button>
-                            <div id="enroll-sample-results" class="training-results" aria-live="polite"></div>
+                            <div class="progress-track">
+                                <div id="train-progress-fill" class="progress-fill"></div>
+                            </div>
+                            <p id="train-detail" class="progress-detail"></p>
+                        </div>
+                        <div id="train-results" class="training-results" aria-live="polite"></div>
+                    </div>
+
+                    <!-- Model comparison -->
+                    <div class="result-card">
+                        <div class="result-card-title">Architecture Comparison</div>
+                        <div id="model-comparison" class="model-comparison-grid">
+                            <p class="empty-state">No dataset-trained models yet. Start training above.</p>
                         </div>
                     </div>
-                </section>
-            </div>
+
+                    <!-- Dataset sample enrollment -->
+                    <div class="result-card">
+                        <div class="result-card-title">Quick Demo Enrollment</div>
+                        <p class="result-card-desc">
+                            Enroll a subject straight from the training dataset to exercise the
+                            enrollment → verification → Grad-CAM workflow in one click.
+                        </p>
+                        <div class="form-row">
+                            <div class="form-group">
+                                <label for="sample-subject" class="form-label">Subject</label>
+                                <input type="text" id="sample-subject" class="form-input" placeholder="Auto (first subject)">
+                            </div>
+                            <div class="form-group">
+                                <label for="sample-limit" class="form-label">Images</label>
+                                <input type="number" id="sample-limit" class="form-input" min="2" max="60" value="12">
+                            </div>
+                        </div>
+                        <button type="button" id="enroll-sample-btn" class="btn btn-secondary btn-block">
+                            <span class="btn-text">Enroll Dataset Sample</span>
+                            <span class="btn-icon">📥</span>
+                        </button>
+                        <div id="enroll-sample-results" class="training-results" aria-live="polite"></div>
+                    </div>
+                </div>
+            </section>
 
             <!-- ========== SIDEBAR — ENROLLED CHILDREN ========== -->
             <aside id="enrolled-list" class="sidebar-card">
@@ -263,6 +284,16 @@
                     <button id="refresh-enrolled-btn" class="btn-icon-only" title="Refresh list" aria-label="Refresh enrolled children list">⟳</button>
                 </div>
                 <div id="enrolled-children-container" class="enrolled-children-list">
+                    <div class="enrolled-child-item">
+                        <div class="child-left">
+                            <span class="child-footprint-avatar" aria-hidden="true"></span>
+                            <div class="child-info">
+                                <span class="child-name">CHILD_001</span>
+                                <span class="child-meta">CHILD_001</span>
+                            </div>
+                        </div>
+                        <!-- keep your existing count badge & action buttons here -->
+                    </div>
                     <p class="empty-state">No children enrolled yet.</p>
                 </div>
 
@@ -288,7 +319,7 @@
 
     <!-- ==================== FOOTER ==================== -->
     <footer id="app-footer">
-        <p>Powered by <strong>TensorFlow</strong> &amp; <strong>OpenCV</strong></p>
+        <p>Powered by <strong>TensorFlow</strong> & <strong>OpenCV</strong></p>
     </footer>
 
     <script src="/static/js/app.js"></script>

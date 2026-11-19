@@ -34,6 +34,9 @@ from fastapi.templating import Jinja2Templates
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data" / "enrolled"
 MODELS_DIR = BASE_DIR / "models"
+# Adult 220-subject benchmark.  It lives beside the child models but is never
+# activated for identification: its checkpoints predict adult IDs.
+BENCHMARK_MODELS_DIR = MODELS_DIR / "adult_220_benchmark"
 DATASET_DIR = BASE_DIR / "Training_Data"
 CACHE_DIR = BASE_DIR / "data" / "cache" / "dataset_224"
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
@@ -465,10 +468,39 @@ def identify_footprint(file: UploadFile = File(...)):
         roi_image = roi_result["roi"]
         roi_mask = roi_result.get("roi_mask")
         roi_viz = roi_result.get("visualization")
-    except Exception:
-        roi_image = cv2.resize(image, (224, 224))
-        roi_mask = None
-        roi_viz = None
+    except Exception as error:
+        # No footprint detected — immediately return "Unknown Child".
+        # Do NOT resize the whole image, which would misclassify non-footprint
+        # inputs (blank images, solid colours, etc.) as enrolled children.
+        return JSONResponse(
+            {
+                "success": True,
+                "prediction": {
+                    "predicted_name": "Unknown Child",
+                    "predicted_id": None,
+                    "predicted_class": None,
+                    "confidence_percent": 0.0,
+                    "is_recognized": False,
+                    "top_3": [],
+                    "threshold": _configured_threshold(),
+                    "is_demo": False,
+                    "match_mode": "embedding",
+                    "similarity": None,
+                    "calibration": None,
+                    "architecture": None,
+                    "architecture_label": None,
+                    "task": None,
+                    "enrolled_children": 0,
+                    "message": (
+                        "No footprint detected in the uploaded image. "
+                        "Please upload a clear footprint photograph."
+                    ),
+                    "detail": str(error),
+                },
+                "gradcam": {},
+                "preprocessing": {},
+            }
+        )
 
     enhanced_image = enhance_footprint(roi_image)["enhanced"]
     enhanced_image = focus_on_creases(enhanced_image, mask=roi_mask)
@@ -495,11 +527,15 @@ def identify_footprint(file: UploadFile = File(...)):
                 target_embedding = classifier.get_child_embedding(target_child)
 
         if target_embedding is not None:
+            gradcam_model = getattr(classifier, "encoder_model", None) or classifier.model
+            gradcam_conv = getattr(classifier, "embedding_last_conv_layer_name", "") or classifier.last_conv_layer_name
+            gradcam_layer = getattr(classifier, "embedding_layer_name", "embedding")
             gradcam_result = generate_similarity_gradcam(
-                classifier.model,
+                gradcam_model,
                 enhanced_image,
-                classifier.last_conv_layer_name,
+                gradcam_conv,
                 target_embedding,
+                embedding_layer_name=gradcam_layer,
             )
         else:
             class_index = prediction.get("predicted_class")
@@ -708,6 +744,62 @@ def dataset_info():
 # ---------------------------------------------------------------------------
 # API: Model registry and selection
 # ---------------------------------------------------------------------------
+def _benchmark_registry() -> dict | None:
+    """Return the adult benchmark registry, if a completed run exists."""
+    path = BENCHMARK_MODELS_DIR / "registry.json"
+    if not path.exists():
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as file:
+            registry = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(registry, dict) or not registry.get("architectures"):
+        return None
+    return registry
+
+
+def _benchmark_payload() -> dict | None:
+    """Shape the benchmark registry for the Model Lab comparison.
+
+    Every entry is marked ``selectable: False``: an adult identity checkpoint
+    outputs ``Adult001…Adult220`` and can never recognise a child.
+    """
+    from app.inference.architectures import ARCHITECTURE_LABELS
+
+    registry = _benchmark_registry()
+    if registry is None:
+        return None
+
+    architectures: dict[str, dict] = {}
+    for key, metrics in (registry.get("architectures") or {}).items():
+        if not isinstance(metrics, dict):
+            continue
+        architectures[str(key)] = {
+            **metrics,
+            "architecture": str(key),
+            "architecture_label": metrics.get("architecture_label")
+            or ARCHITECTURE_LABELS.get(str(key), str(key)),
+            "selectable": False,
+            "source": "adult-benchmark",
+        }
+    if not architectures:
+        return None
+
+    dataset = registry.get("dataset") or {}
+    subjects = dataset.get("subjects") or []
+    return {
+        "available": True,
+        "task": registry.get("task"),
+        "best_model": registry.get("best_model"),
+        "class_names": registry.get("class_names") or [],
+        "generated_at": registry.get("generated_at"),
+        "subjects": len(subjects) if isinstance(subjects, list) else dataset.get("subject_count"),
+        "split": registry.get("split") or {},
+        "architectures": architectures,
+    }
+
+
 @app.get("/api/models")
 def list_models():
     """Return the trained-model registry and the comparison metrics.
@@ -716,6 +808,7 @@ def list_models():
     start, which must not happen inside the event loop.
     """
     registry_path = MODELS_DIR / "registry.json"
+    benchmark = _benchmark_payload()
     if not registry_path.exists():
         return JSONResponse(
             {
@@ -724,7 +817,12 @@ def list_models():
                 "best_model": None,
                 "active_model": None,
                 "task": None,
-                "message": "No dataset-trained models yet. Start training to compare the three architectures.",
+                "benchmark": benchmark,
+                "message": (
+                    "No child-identification models yet. Start training to compare architectures."
+                    if benchmark is None
+                    else "No child-identification models yet; the adult benchmark below is display-only."
+                ),
             }
         )
 
@@ -734,6 +832,7 @@ def list_models():
         {
             "has_registry": True,
             **registry,
+            "benchmark": benchmark,
             "model_info": _get_classifier().get_model_info(),
         }
     )
@@ -743,18 +842,34 @@ def list_models():
 async def model_artifact(
     architecture: str = Query(..., min_length=1),
     kind: str = Query(default="training"),
+    source: str = Query(default="registry"),
 ):
-    """Return a training curve or confusion matrix as a base64 PNG."""
-    registry_path = MODELS_DIR / "registry.json"
-    if not registry_path.exists():
-        raise HTTPException(status_code=404, detail="No trained model registry exists")
-    with registry_path.open("r", encoding="utf-8") as file:
-        registry = json.load(file)
+    """Return a training curve, confusion matrix or normalised heatmap as a base64 PNG.
 
-    metrics = registry.get("architectures", {}).get(architecture)
+    ``source=benchmark`` is required for the adult benchmark cards because the
+    architecture keys (``mobilenetv2``, ``custom_cnn``) also exist in the child
+    registry; without it the benchmark card would show the wrong curves.
+    """
+    task = "model"
+    metrics = None
+    if source == "benchmark":
+        benchmark = _benchmark_registry() or {}
+        metrics = (benchmark.get("architectures") or {}).get(architecture)
+        task = benchmark.get("task", task)
+    else:
+        registry_path = MODELS_DIR / "registry.json"
+        if not registry_path.exists():
+            raise HTTPException(status_code=404, detail="No trained model registry exists")
+        with registry_path.open("r", encoding="utf-8") as file:
+            registry = json.load(file)
+        metrics = registry.get("architectures", {}).get(architecture)
+        task = registry.get("task", task)
+        if not isinstance(metrics, dict):
+            benchmark = _benchmark_registry() or {}
+            metrics = (benchmark.get("architectures") or {}).get(architecture)
+            task = benchmark.get("task", task)
     if not isinstance(metrics, dict):
         raise HTTPException(status_code=404, detail=f"Architecture '{architecture}' is not registered")
-    task = registry.get("task", "model")
 
     if kind == "training":
         candidate = metrics.get("training_plot_path") or str(
@@ -764,21 +879,58 @@ async def model_artifact(
         candidate = metrics.get("confusion_matrix_path") or str(
             MODELS_DIR / f"{architecture}_{task}_confusion_matrix.png"
         )
+    elif kind == "normalized_confusion":
+        candidate = metrics.get("normalized_confusion_path") or str(
+            MODELS_DIR / f"{architecture}_{task}_normalized_confusion.png"
+        )
     else:
-        raise HTTPException(status_code=400, detail="kind must be 'training' or 'confusion'")
+        raise HTTPException(
+            status_code=400,
+            detail="kind must be 'training', 'confusion' or 'normalized_confusion'",
+        )
 
     path = Path(candidate).resolve()
     if MODELS_DIR.resolve() not in path.parents or not path.exists():
         raise HTTPException(status_code=404, detail="Artifact is not available")
-    payload = base64.b64encode(path.read_bytes()).decode("utf-8")
+    payload, mime = _artifact_payload(path)
     return JSONResponse(
         {
             "architecture": architecture,
             "kind": kind,
             "filename": path.name,
+            "mime": mime,
             "image": payload,
         }
     )
+
+
+def _artifact_payload(path: Path, max_side: int = 1400) -> tuple[str, str]:
+    """Base64-encode an artifact, downscaling benchmark-sized figures.
+
+    A 220-class confusion matrix is plotted at 12,410×12,410 px (~36 MB).
+    Shipping that to the browser (and base64-inflating it) freezes the Model
+    Lab tab, so large figures are resized and re-encoded as JPEG.
+    """
+    raw = path.read_bytes()
+    if len(raw) <= 2 * 1024 * 1024:
+        return base64.b64encode(raw).decode("utf-8"), "image/png"
+
+    image = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        return base64.b64encode(raw).decode("utf-8"), "image/png"
+
+    height, width = image.shape[:2]
+    scale = min(1.0, float(max_side) / max(height, width))
+    if scale < 1.0:
+        image = cv2.resize(
+            image,
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+    success, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 88])
+    if not success:
+        return base64.b64encode(raw).decode("utf-8"), "image/png"
+    return base64.b64encode(buffer.tobytes()).decode("utf-8"), "image/jpeg"
 
 
 @app.post("/api/models/select")
@@ -793,6 +945,16 @@ async def select_model(architecture: str = Query(..., min_length=1)):
         registry = json.load(file)
     if architecture not in registry.get("architectures", {}):
         raise HTTPException(status_code=404, detail=f"Architecture '{architecture}' is not registered")
+    entry = registry["architectures"][architecture]
+    if isinstance(entry, dict) and entry.get("selectable") is False:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This is a dataset-benchmark model trained on an earlier "
+                "class set; retrain it from enrollments before using it for "
+                "identification."
+            ),
+        )
 
     model_path = registry.get("model_paths", {}).get(architecture)
     if not model_path or not Path(model_path).exists():
@@ -884,8 +1046,48 @@ def retrain_model(
         _RETRAIN_LOCK.release()
 
 
+def _benchmark_registry_entry(architecture: str) -> dict | None:
+    """Build a display-only registry entry from a dataset-benchmark run.
+
+    These checkpoints were trained on an earlier dataset snapshot, so they are
+    kept in the Model Lab for comparison but cannot be activated: their output
+    layer does not match the current enrollment class list.
+    """
+    metrics_path = MODELS_DIR / f"{architecture}_identity_metrics.json"
+    if not metrics_path.exists():
+        return None
+    try:
+        with metrics_path.open("r", encoding="utf-8") as file:
+            metrics = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(metrics, dict):
+        return None
+    model_path = metrics.get("model_path") or str(
+        MODELS_DIR / f"{architecture}_identity.keras"
+    )
+    if not Path(model_path).exists():
+        return None
+    return {
+        **metrics,
+        "architecture": architecture,
+        "model_path": str(Path(model_path).resolve()),
+        "source": "dataset-benchmark",
+        "selectable": False,
+    }
+
+
 def _activate_enrollment_model(result: dict, architecture: str) -> None:
-    """Write a minimal registry so the classifier picks the new identity model."""
+    """Register the retrained identity model without losing the Model Lab.
+
+    The registry also drives the architecture comparison, so replacing it
+    wholesale used to make EfficientNet-B0 and the custom CNN disappear after
+    every retrain.  Preserve what is already registered, drop stale enrollment
+    entries (there is a single ``footprint_model.keras`` checkpoint), restore
+    any benchmark checkpoints still on disk, then add the fresh entry.
+    """
+    from app.inference.architectures import ARCHITECTURE_LABELS
+
     classes_path = Path(result["classes_path"])
     meta_path = MODELS_DIR / "footprint_model_meta.json"
     with classes_path.open("r", encoding="utf-8") as file:
@@ -899,41 +1101,91 @@ def _activate_enrollment_model(result: dict, architecture: str) -> None:
         with meta_path.open("r", encoding="utf-8") as file:
             meta = json.load(file)
 
+    registry_path = MODELS_DIR / "registry.json"
+    previous: dict = {}
+    if registry_path.exists():
+        try:
+            with registry_path.open("r", encoding="utf-8") as file:
+                loaded = json.load(file)
+            if isinstance(loaded, dict):
+                previous = loaded
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+
+    architectures = dict(previous.get("architectures") or {})
+    model_paths = dict(previous.get("model_paths") or {})
+    calibrations = dict(previous.get("calibrations") or {})
+
+    for key, entry in list(architectures.items()):
+        if (
+            key != architecture
+            and isinstance(entry, dict)
+            and entry.get("source") == "enrollments"
+        ):
+            architectures.pop(key, None)
+            model_paths.pop(key, None)
+            calibrations.pop(key, None)
+
+    for key in ARCHITECTURE_LABELS:
+        if key not in architectures:
+            benchmark = _benchmark_registry_entry(key)
+            if benchmark is not None:
+                architectures[key] = benchmark
+                model_paths[key] = benchmark["model_path"]
+
     model_path = str(Path(result["model_path"]).resolve())
+    validation_accuracy = result.get("validation_accuracy")
+    entry = {
+        "architecture": architecture,
+        "architecture_label": ARCHITECTURE_LABELS.get(architecture, architecture),
+        "model_path": model_path,
+        "test_accuracy": (
+            round(validation_accuracy / 100, 4)
+            if isinstance(validation_accuracy, (int, float))
+            else None
+        ),
+        "accuracy_label": "Validation accuracy",
+        "test_top3_accuracy": None,
+        "test_macro_f1": None,
+        "training_seconds": result.get("training_seconds"),
+        "parameters": result.get("parameters"),
+        "epochs_completed": int(result.get("epochs_completed", 0))
+        + int(result.get("fine_tune_epochs_completed", 0)),
+        "test_images": result.get("val_images"),
+        "last_conv_layer": meta.get("last_conv_layer", ""),
+        "initialization": (
+            "imagenet"
+            if architecture in {"mobilenetv2", "efficientnetb0"}
+            else "scratch"
+        ),
+        "training_accuracy": result.get("training_accuracy"),
+        "validation_accuracy": result.get("validation_accuracy"),
+        "source": "enrollments",
+        "selectable": True,
+    }
+    architectures[architecture] = entry
+    model_paths[architecture] = model_path
+    calibrations[architecture] = {"center": 0.72, "scale": 0.08}
+
     registry = {
+        **previous,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "task": "identity",
         "class_names": class_names,
         "dataset": {"source": "enrolled children", "images": result.get("images_used", 0)},
         "split": {},
-        "architectures": {
-            architecture: {
-                "architecture": architecture,
-                "architecture_label": "Custom CNN (enrollment)"
-                if architecture == "custom_cnn"
-                else architecture,
-                "model_path": model_path,
-                "test_accuracy": None,
-                "test_top3_accuracy": None,
-                "test_macro_f1": None,
-                "training_seconds": None,
-                "parameters": None,
-                "last_conv_layer": meta.get("last_conv_layer", ""),
-                "source": "enrollments",
-            }
-        },
+        "architectures": architectures,
         "best_model": architecture,
         "active_model": architecture,
-        "model_paths": {architecture: model_path},
+        "model_paths": model_paths,
         "best_model_path": model_path,
-        "calibration": {"center": 0.72, "scale": 0.08},
-        "calibrations": {architecture: {"center": 0.72, "scale": 0.08}},
+        "calibration": calibrations[architecture],
+        "calibrations": calibrations,
         "preprocessing": {
             "pipeline": "ROI (midfoot/arch 40-75%) -> CLAHE -> 6-orientation Gabor bank",
             "input_size": 224,
         },
     }
-    registry_path = MODELS_DIR / "registry.json"
     temporary = registry_path.with_suffix(".tmp")
     with temporary.open("w", encoding="utf-8") as file:
         json.dump(registry, file, indent=2)

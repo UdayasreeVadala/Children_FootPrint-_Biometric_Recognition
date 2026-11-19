@@ -16,10 +16,21 @@ skin colour and — as a last resort — GrabCut), scores each mask for
 from __future__ import annotations
 
 import math
+import threading
 from pathlib import Path
 
 import cv2
 import numpy as np
+
+
+# GrabCut initialises its Gaussian mixture models with ``cv2.kmeans``, which
+# draws from OpenCV's global RNG.  Without a fixed seed the same photo produced
+# a different mask (and therefore a different ROI, enhancement and prediction)
+# on every call: repeated identifications of one image could disagree, and the
+# stored enrollment crops could never be reproduced.  Seed it deterministically
+# and serialise the call so concurrent requests cannot interleave the RNG.
+_GRABCUT_LOCK = threading.Lock()
+_GRABCUT_SEED = 0
 
 
 # ---------------------------------------------------------------------------
@@ -224,15 +235,17 @@ def _grabcut_mask(image: np.ndarray, margin: float = 0.12) -> np.ndarray | None:
         height - 2 * margin_y,
     )
     try:
-        cv2.grabCut(
-            working,
-            mask,
-            rectangle,
-            background_model,
-            foreground_model,
-            5,
-            cv2.GC_INIT_WITH_RECT,
-        )
+        with _GRABCUT_LOCK:
+            cv2.setRNGSeed(_GRABCUT_SEED)
+            cv2.grabCut(
+                working,
+                mask,
+                rectangle,
+                background_model,
+                foreground_model,
+                5,
+                cv2.GC_INIT_WITH_RECT,
+            )
     except cv2.error:
         return None
     result = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
@@ -257,6 +270,89 @@ def _bbox_is_implausible(contour: np.ndarray, shape: tuple[int, int]) -> bool:
     if box_width * box_height >= 0.82 * width * height:
         return True
     return False
+
+
+def footprint_quality(
+    image: np.ndarray, mask: np.ndarray, contour: np.ndarray
+) -> dict:
+    """Describe how much the selected region looks like a real footprint.
+
+    The segmentation stage always returns *some* contour, even for a blank page
+    or a photo of a wall.  This quality report is the guard that distinguishes
+    a genuine footprint from an arbitrary blob so that non-footprint uploads can
+    be rejected before they reach the classifier.
+    """
+    height, width = image.shape[:2]
+    gray = (
+        cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if image.ndim == 3
+        else image
+    )
+    area = float(cv2.contourArea(contour))
+    image_area = float(height * width)
+    x, y, box_width, box_height = cv2.boundingRect(contour)
+    box_area = float(max(1, box_width * box_height))
+    hull_area = float(cv2.contourArea(cv2.convexHull(contour)))
+    perimeter = float(cv2.arcLength(contour, True))
+
+    mask_bool = mask > 0
+    inside = gray[mask_bool]
+    outside = gray[~mask_bool]
+    contrast = (
+        abs(float(inside.mean()) - float(outside.mean()))
+        if inside.size and outside.size
+        else 0.0
+    )
+
+    texture = _local_texture(gray, 15)
+    inside_texture = (
+        float(texture[mask_bool].mean()) if np.any(mask_bool) else 0.0
+    )
+
+    points = contour.reshape(-1, 2)
+    border_hits = np.sum(
+        (points[:, 0] <= 2)
+        | (points[:, 0] >= width - 3)
+        | (points[:, 1] <= 2)
+        | (points[:, 1] >= height - 3)
+    )
+
+    quality = {
+        "area": area,
+        "area_ratio": area / image_area if image_area else 0.0,
+        "bbox_ratio": (box_width * box_height) / image_area if image_area else 0.0,
+        "solidity": area / hull_area if hull_area > 0 else 0.0,
+        "extent": area / box_area,
+        "aspect": max(box_width, box_height) / max(1.0, float(min(box_width, box_height))),
+        "circularity": (4.0 * math.pi * area / (perimeter * perimeter)) if perimeter > 0 else 0.0,
+        "border_contact": float(border_hits) / max(1, len(points)),
+        "contrast": contrast,
+        "texture": inside_texture,
+    }
+
+    reasons: list[str] = []
+    if quality["area_ratio"] < 0.02:
+        reasons.append("foreground too small")
+    # NOTE: a legitimate close-up photo (and an already-cropped ROI) can fill
+    # most of the frame, so "covers the whole frame" is intentionally not a
+    # rejection reason.  Uniform images are still rejected by the contrast,
+    # outline and border-contact checks below.
+    if quality["contrast"] < 3.0:
+        reasons.append("no foreground/background contrast")
+    if quality["aspect"] < 1.03 or quality["aspect"] > 6.0:
+        reasons.append("implausible footprint aspect ratio")
+    if quality["solidity"] < 0.45:
+        reasons.append("implausible footprint shape")
+    if quality["extent"] < 0.20 or quality["extent"] > 0.995:
+        reasons.append("implausible footprint outline")
+    if quality["circularity"] > 0.80:
+        reasons.append("region is too round to be a footprint")
+    if quality["border_contact"] > 0.5:
+        reasons.append("region touches the image border")
+
+    quality["is_footprint"] = not reasons
+    quality["reasons"] = reasons
+    return quality
 
 
 def segment_foot(image: np.ndarray) -> tuple[np.ndarray, np.ndarray, list]:
@@ -466,7 +562,22 @@ def process_footprint(
             )
 
         mask, cleaned_threshold, contours = segment_foot(image)
-        largest_contour = max(contours, key=cv2.contourArea)
+        # ``segment_foot`` already selected the most foot-like contour and
+        # returned the mask filled from it.  Re-deriving the contour from that
+        # mask keeps the two in sync (the largest *candidate* contour is not
+        # necessarily the selected one).
+        selected = _collect_contours(mask)
+        largest_contour = (
+            max(selected, key=cv2.contourArea)
+            if selected
+            else max(contours, key=cv2.contourArea)
+        )
+        quality = footprint_quality(image, mask, largest_contour)
+        if not quality.get("is_footprint", True):
+            reasons = ", ".join(quality.get("reasons") or ["no footprint found"])
+            raise ValueError(
+                f"No footprint detected in the uploaded image ({reasons})."
+            )
         roi, roi_mask, region_info = extract_roi(image, mask, largest_contour)
 
         result = {
@@ -475,6 +586,7 @@ def process_footprint(
             "mask": mask,
             "threshold": cleaned_threshold,
             "region_info": region_info,
+            "quality": quality,
         }
         if return_visualization:
             result["visualization"] = visualize_regions(image, largest_contour, region_info)

@@ -78,6 +78,14 @@ class FootprintClassifier:
         self._enrollment_cache_key: tuple | None = None
         self._child_embeddings: dict[str, np.ndarray] = {}
         self._child_records: dict[str, dict[str, str]] = {}
+        self._whitening: tuple[np.ndarray, np.ndarray] | None = None
+        self.whitening_dim = 0
+        self.min_margin = 0.0
+        self.embedding_config: dict = {}
+        self.encoder_config: dict = {}
+        self.encoder_model: tf.keras.Model | None = None
+        self.embedding_layer_name = "embedding"
+        self.embedding_last_conv_layer_name = ""
 
         if model_path and Path(model_path).exists():
             self.load_model(model_path)
@@ -124,8 +132,62 @@ class FootprintClassifier:
         }
         self.architecture_label = ARCHITECTURE_LABELS.get(self.architecture, self.architecture)
         self.model_metrics = registry.get("architectures", {}).get(self.architecture, {})
+        embedding_config = registry.get("embedding", {}) or {}
+        self.embedding_config = (
+            dict(embedding_config) if isinstance(embedding_config, dict) else {}
+        )
+        try:
+            self.whitening_dim = int(self.embedding_config.get("whitening_dim", 0) or 0)
+        except (TypeError, ValueError):
+            self.whitening_dim = 0
+        try:
+            self.min_margin = float(self.embedding_config.get("min_margin", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            self.min_margin = 0.0
+        encoder_config = registry.get("encoder", {}) or {}
+        self.encoder_config = (
+            dict(encoder_config) if isinstance(encoder_config, dict) else {}
+        )
         self.load_model(candidate, task=self.task, class_names=self.class_names)
+        self._load_encoder_model()
         return True
+
+    def _load_encoder_model(self) -> None:
+        """Optionally load a dedicated encoder for identity embeddings.
+
+        A model trained for another task (for example the adult identity
+        benchmark) can be used as a fixed feature extractor for children while
+        the enrolled gallery supplies the child centroids.  The working
+        feature layer is usually a spatial head, not the ReLU embedding.
+        """
+        if tf is None:
+            return
+        encoder_path = self.encoder_config.get("model_path")
+        if not encoder_path or not Path(str(encoder_path)).exists():
+            return
+        encoder = tf.keras.models.load_model(str(encoder_path))
+        layer_name = str(self.encoder_config.get("feature_layer", "embedding"))
+        try:
+            layer = encoder.get_layer(layer_name)
+        except ValueError:
+            layer_name = "embedding"
+            layer = encoder.get_layer(layer_name)
+        self.encoder_model = encoder
+        self.embedding_layer_name = layer_name
+        self.embedding_model = tf.keras.Model(encoder.inputs, layer.output)
+        self.embedding_last_conv_layer_name = find_last_conv_layer(encoder)
+        try:
+            override = int(self.encoder_config.get("whitening_dim", self.whitening_dim) or 0)
+        except (TypeError, ValueError):
+            override = self.whitening_dim
+        if override > 0:
+            self.whitening_dim = override
+        encoder_calibration = self.encoder_config.get("calibration")
+        if isinstance(encoder_calibration, dict) and encoder_calibration:
+            self.calibration = {
+                "center": float(encoder_calibration.get("center", self.calibration["center"])),
+                "scale": float(encoder_calibration.get("scale", self.calibration["scale"])),
+            }
 
     def _load_legacy_model(self) -> bool:
         for extension in (".keras", ".h5"):
@@ -168,6 +230,9 @@ class FootprintClassifier:
         path = Path(model_path)
         self.model = tf.keras.models.load_model(str(path))
         self.model_path = str(path)
+        self.encoder_model = None
+        self.embedding_layer_name = "embedding"
+        self.embedding_last_conv_layer_name = ""
         self.is_demo = False
         self.last_conv_layer_name = find_last_conv_layer(self.model)
         try:
@@ -363,7 +428,8 @@ class FootprintClassifier:
             return
 
         names = self._enrollment_metadata()
-        child_embeddings: dict[str, np.ndarray] = {}
+        per_child: dict[str, list[np.ndarray]] = {}
+        all_vectors: list[np.ndarray] = []
         for child_id, paths in images.items():
             vectors: list[np.ndarray] = []
             batch: list[np.ndarray] = []
@@ -377,11 +443,26 @@ class FootprintClassifier:
                     batch = []
             if batch:
                 vectors.extend(self._embed_images(batch))
-            if vectors:
-                mean = np.mean(np.stack(vectors), axis=0)
-                norm = np.linalg.norm(mean)
-                if norm > 0:
-                    child_embeddings[child_id] = mean / norm
+            per_child[child_id] = vectors
+            all_vectors.extend(vectors)
+
+        # Cosine similarity on raw deep features is dominated by a few
+        # near-constant directions (lighting, sensor), which makes every pair
+        # of images look ~99% similar.  Whitening, fitted on the enrolled
+        # gallery itself, removes those directions without using labels.
+        self._whitening = self._fit_whitening(np.stack(all_vectors)) if all_vectors else None
+
+        child_embeddings: dict[str, np.ndarray] = {}
+        for child_id, vectors in per_child.items():
+            if not vectors:
+                continue
+            matrix = np.stack(vectors)
+            if self._whitening is not None:
+                matrix = self._apply_whitening(matrix)
+            mean = np.mean(matrix, axis=0)
+            norm = np.linalg.norm(mean)
+            if norm > 0:
+                child_embeddings[child_id] = mean / norm
 
         self._child_embeddings = child_embeddings
         self._child_records = {
@@ -389,6 +470,43 @@ class FootprintClassifier:
             for child_id in child_embeddings
         }
         self._enrollment_cache_key = cache_key
+
+    def _fit_whitening(
+        self, vectors: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Fit a PCA-whitening transform on the enrollment embeddings.
+
+        Uses an SVD of the centred matrix, which is O(n·d²) with n ≈ 250
+        images, rather than an eigendecomposition of the d×d covariance
+        (d is 256–3136).
+        """
+        dim = int(getattr(self, "whitening_dim", 0) or 0)
+        count = int(vectors.shape[0])
+        if dim <= 0 or count <= dim + 1:
+            return None
+        mean = vectors.mean(axis=0)
+        centered = vectors - mean
+        _, singular, components = np.linalg.svd(centered, full_matrices=False)
+        if singular.shape[0] < dim:
+            return None
+        variances = (singular[:dim] ** 2) / max(1, count - 1)
+        scale = 1.0 / np.sqrt(np.maximum(variances, 1e-8))
+        projection = (components[:dim] * scale[:, None]).T
+        return mean, projection
+
+    def _apply_whitening(
+        self,
+        vectors: np.ndarray,
+        state: tuple[np.ndarray, np.ndarray] | None = None,
+    ) -> np.ndarray:
+        resolved = state if state is not None else self._whitening
+        if resolved is None:
+            return vectors
+        mean, projection = resolved
+        transformed = (vectors - mean) @ projection
+        norms = np.linalg.norm(transformed, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        return transformed / norms
 
     def _embed_images(self, images: Iterable[np.ndarray]) -> list[np.ndarray]:
         if self.embedding_model is None:
@@ -398,15 +516,20 @@ class FootprintClassifier:
             axis=0,
         )
         vectors = np.asarray(self.embedding_model.predict(batch, verbose=0), dtype=np.float64)
-        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        return list(vectors / norms)
+        # Return the *raw* network activations: whitening is fitted on these
+        # and normalises afterwards.  Cosine similarity is scale invariant, so
+        # the no-whitening path is unaffected.
+        return [row for row in vectors]
 
     def _query_embedding(self, image: np.ndarray) -> np.ndarray:
         vectors = self._embed_images([image])
         if not vectors:
             raise RuntimeError("The loaded model does not expose an embedding layer")
-        return vectors[0]
+        vector = vectors[0]
+        state = getattr(self, "_whitening", None)
+        if state is not None:
+            vector = self._apply_whitening(vector[None, :], state)[0]
+        return vector
 
     @staticmethod
     def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
@@ -550,8 +673,26 @@ class FootprintClassifier:
         scored.sort(key=lambda item: item[1], reverse=True)
 
         child_id, similarity, confidence = scored[0]
+        runner_up = scored[1][1] if len(scored) > 1 else 0.0
+        margin = similarity - runner_up
         label = self._child_records[child_id]
-        is_recognized = confidence >= self.confidence_threshold
+
+        min_margin = float(getattr(self, "min_margin", 0.0) or 0.0)
+        config = getattr(self, "embedding_config", {}) or {}
+        try:
+            min_similarity = float(config.get("min_similarity", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            min_similarity = 0.0
+
+        reasons: list[str] = []
+        if confidence < self.confidence_threshold:
+            reasons.append("similarity below the acceptance threshold")
+        if similarity < min_similarity:
+            reasons.append("absolute similarity below the open-set floor")
+        if min_margin > 0.0 and margin < min_margin:
+            reasons.append("closest enrolled child is not clearly ahead of the runner-up")
+        is_recognized = not reasons
+
         top_3 = [
             {
                 "class": index,
@@ -562,7 +703,7 @@ class FootprintClassifier:
             }
             for index, (candidate_id, candidate_similarity, candidate_confidence) in enumerate(scored[:3])
         ]
-        return {
+        result = {
             **self._base_result(),
             "predicted_class": top_3[0]["class"] if top_3 else None,
             "predicted_id": label["child_id"] if is_recognized else None,
@@ -573,9 +714,16 @@ class FootprintClassifier:
             "top_3": top_3,
             "all_probabilities": [item[2] for item in scored],
             "similarity": similarity,
+            "similarity_margin": margin,
+            "min_margin": min_margin,
             "enrolled_children": len(scored),
             "calibration": dict(self.calibration),
         }
+        if reasons:
+            result["message"] = (
+                "No confident match to an enrolled child: " + "; ".join(reasons) + "."
+            )
+        return result
 
     # ------------------------------------------------------------------
     # Diagnostics
@@ -601,6 +749,13 @@ class FootprintClassifier:
             "class_names": self.class_names,
             "enrolled_children": len(self._child_embeddings) if self.match_mode == "embedding" else len(self.class_records),
             "calibration": dict(self.calibration),
+            "whitening_dim": int(getattr(self, "whitening_dim", 0) or 0),
+            "embedding_layer": getattr(self, "embedding_layer_name", "embedding"),
+            "encoder_model_path": (
+                self.encoder_config.get("model_path")
+                if getattr(self, "encoder_model", None) is not None
+                else None
+            ),
             "model_path": self.model_path,
             "metrics": self.model_metrics,
             "has_registry": self.registry is not None,
@@ -609,6 +764,8 @@ class FootprintClassifier:
     def reload(self) -> None:
         """Reload registry/model state after a new training run."""
         self._enrollment_cache_key = None
+        self._whitening = None
+        self.encoder_model = None
         self.registry = None
         self.model = None
         self.embedding_model = None
